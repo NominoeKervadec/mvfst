@@ -44,8 +44,13 @@ QuicServerTransport::QuicServerTransport(
     ConnectionSetupCallback* connSetupCb,
     ConnectionCallbackNew* connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
-    std::unique_ptr<CryptoFactory> cryptoFactory)
-    : QuicTransportBase(evb, std::move(sock)), ctx_(std::move(ctx)) {
+    std::unique_ptr<CryptoFactory> cryptoFactory,
+    bool useConnectionEndWithErrorCallback)
+    : QuicTransportBase(
+          evb,
+          std::move(sock),
+          useConnectionEndWithErrorCallback),
+      ctx_(std::move(ctx)) {
   auto tempConn = std::make_unique<QuicServerConnectionState>(
       FizzServerQuicHandshakeContext::Builder()
           .setFizzServerContext(ctx_)
@@ -78,14 +83,16 @@ QuicServerTransport::Ptr QuicServerTransport::make(
     std::unique_ptr<folly::AsyncUDPSocket> sock,
     ConnectionSetupCallback* connSetupCb,
     ConnectionCallbackNew* connStreamsCb,
-    std::shared_ptr<const fizz::server::FizzServerContext> ctx) {
+    std::shared_ptr<const fizz::server::FizzServerContext> ctx,
+    bool useConnectionEndWithErrorCallback) {
   return std::make_shared<QuicServerTransport>(
       evb,
       std::move(sock),
       connSetupCb,
       connStreamsCb,
       ctx,
-      nullptr /* cryptoFactory */);
+      nullptr /* cryptoFactory */,
+      useConnectionEndWithErrorCallback);
 }
 
 void QuicServerTransport::setRoutingCallback(
@@ -433,17 +440,15 @@ void QuicServerTransport::handleTransportKnobParams(
     const TransportKnobParams& params) {
   for (const auto& param : params) {
     auto maybeParamHandler = transportKnobParamHandlers_.find(param.id);
+    TransportKnobParamId knobParamId = TransportKnobParamId::UNKNOWN;
+    if (TransportKnobParamId::_is_valid(param.id)) {
+      knobParamId = TransportKnobParamId::_from_integral(param.id);
+    }
     if (maybeParamHandler != transportKnobParamHandlers_.end()) {
       (maybeParamHandler->second)(this, param.val);
-      QUIC_STATS(
-          conn_->statsCallback,
-          onTransportKnobApplied,
-          QuicTransportStatsCallback::paramIdToTransportKnobType(param.id));
+      QUIC_STATS(conn_->statsCallback, onTransportKnobApplied, knobParamId);
     } else {
-      QUIC_STATS(
-          conn_->statsCallback,
-          onTransportKnobError,
-          QuicTransportStatsCallback::paramIdToTransportKnobType(param.id));
+      QUIC_STATS(conn_->statsCallback, onTransportKnobError, knobParamId);
     }
   }
 }
@@ -661,7 +666,7 @@ void QuicServerTransport::onTransportKnobs(Buf knobBlob) {
       QUIC_STATS(
           conn_->statsCallback,
           onTransportKnobError,
-          QuicTransportStatsCallback::TransportKnobType::UNKNOWN);
+          TransportKnobParamId::UNKNOWN);
     }
   }
 }

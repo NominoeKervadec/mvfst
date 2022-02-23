@@ -28,9 +28,11 @@ namespace quic {
 
 QuicTransportBase::QuicTransportBase(
     folly::EventBase* evb,
-    std::unique_ptr<folly::AsyncUDPSocket> socket)
+    std::unique_ptr<folly::AsyncUDPSocket> socket,
+    bool useConnectionEndWithErrorCallback)
     : evb_(evb),
       socket_(std::move(socket)),
+      useConnectionEndWithErrorCallback_(useConnectionEndWithErrorCallback),
       lossTimeout_(this),
       ackTimeout_(this),
       pathValidationTimeout_(this),
@@ -173,6 +175,14 @@ bool QuicTransportBase::error() const {
   return conn_->localConnectionError.has_value();
 }
 
+QuicError QuicTransportBase::maybeSetGenericAppError(
+    folly::Optional<QuicError> error) {
+  return error ? error.value()
+               : QuicError(
+                     GenericApplicationErrorCode::NO_ERROR,
+                     toString(GenericApplicationErrorCode::NO_ERROR));
+}
+
 void QuicTransportBase::close(folly::Optional<QuicError> errorCode) {
   FOLLY_MAYBE_UNUSED auto self = sharedGuard();
   // The caller probably doesn't need a conn callback any more because they
@@ -181,11 +191,7 @@ void QuicTransportBase::close(folly::Optional<QuicError> errorCode) {
 
   // If we were called with no error code, ensure that we are going to write
   // an application close, so the peer knows it didn't come from the transport.
-  if (!errorCode) {
-    errorCode = QuicError(
-        GenericApplicationErrorCode::NO_ERROR,
-        toString(GenericApplicationErrorCode::NO_ERROR));
-  }
+  errorCode = maybeSetGenericAppError(errorCode);
   closeImpl(std::move(errorCode), true);
   conn_->logger.reset();
 }
@@ -194,11 +200,7 @@ void QuicTransportBase::closeNow(folly::Optional<QuicError> errorCode) {
   DCHECK(getEventBase() && getEventBase()->isInEventBaseThread());
   FOLLY_MAYBE_UNUSED auto self = sharedGuard();
   VLOG(4) << __func__ << " " << *this;
-  if (!errorCode) {
-    errorCode = QuicError(
-        GenericApplicationErrorCode::NO_ERROR,
-        toString(GenericApplicationErrorCode::NO_ERROR));
-  }
+  errorCode = maybeSetGenericAppError(errorCode);
   closeImpl(std::move(errorCode), false);
   // the drain timeout may have been scheduled by a previous close, in which
   // case, our close would not take effect. This cancels the drain timeout in
@@ -475,12 +477,16 @@ void QuicTransportBase::processConnectionCallbacks(
     return;
   }
 
+  if (useConnectionEndWithErrorCallback_) {
+    connCallback_->onConnectionEnd(cancelCode);
+    return;
+  }
+
   bool noError = processCancelCode(cancelCode);
   if (noError) {
     connCallback_->onConnectionEnd();
   } else {
-    connCallback_->onConnectionError(
-        QuicError(cancelCode.code, cancelCode.message));
+    connCallback_->onConnectionError(cancelCode);
   }
 }
 

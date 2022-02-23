@@ -38,7 +38,8 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
  public:
   QuicTransportBase(
       folly::EventBase* evb,
-      std::unique_ptr<folly::AsyncUDPSocket> socket);
+      std::unique_ptr<folly::AsyncUDPSocket> socket,
+      bool useConnectionEndWithErrorCallback = false);
 
   ~QuicTransportBase() override;
 
@@ -750,6 +751,12 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
       bool bidirectional);
 
   /**
+   * Helper function - if given error is not set, returns a generic app error.
+   * Used by close() and closeNow().
+   */
+  QuicError maybeSetGenericAppError(folly::Optional<QuicError> error);
+
+  /**
    * write data to socket
    *
    * At transport layer, this is the simplest form of write. It writes data
@@ -860,6 +867,8 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   std::unique_ptr<folly::AsyncUDPSocket> socket_;
   ConnectionSetupCallback* connSetupCallback_{nullptr};
   ConnectionCallbackNew* connCallback_{nullptr};
+  // A flag telling transport if the new onConnectionEnd(error) cb must be used.
+  bool useConnectionEndWithErrorCallback_{false};
 
   std::
       unique_ptr<QuicConnectionStateBase, folly::DelayedDestruction::Destructor>
