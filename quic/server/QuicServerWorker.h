@@ -571,7 +571,10 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
   folly::F14FastMap<QuicServerTransport*, std::weak_ptr<QuicServerTransport>>
       boundServerTransports_;
 
+ public:
   Buf readBuffer_;
+
+ private:
   bool shutdown_{false};
   std::vector<QuicVersion> supportedVersions_;
   std::shared_ptr<const fizz::server::FizzServerContext> ctx_;

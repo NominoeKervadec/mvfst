@@ -226,7 +226,10 @@ class QuicClientTransport
       const QuicWriteFrame& packetFrame,
       const ReadAckFrame&);
 
+ public:
   Buf readBuffer_;
+
+ protected:
   folly::Optional<std::string> hostname_;
   HappyEyeballsConnAttemptDelayTimeout happyEyeballsConnAttemptDelayTimeout_;
 
