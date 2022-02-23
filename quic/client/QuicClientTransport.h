@@ -193,6 +193,7 @@ class QuicClientTransport
  protected:
   // From AsyncUDPSocket::ReadCallback
   void getReadBuffer(void** buf, size_t* len) noexcept override;
+  void setReadBuffer(std::unique_ptr<folly::IOBuf> buf) noexcept override;
   void onDataAvailable(
       const folly::SocketAddress& server,
       size_t len,

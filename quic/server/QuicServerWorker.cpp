@@ -186,6 +186,11 @@ void QuicServerWorker::getReadBuffer(void** buf, size_t* len) noexcept {
   *len = transportSettings_.maxRecvPacketSize * numGROBuffers_;
 }
 
+void QuicServerWorker::setReadBuffer(
+    std::unique_ptr<folly::IOBuf> buf) noexcept {
+  readBuffer_ = std::move(buf);
+}
+
 // Returns true if we either drop the packet or send a version
 // negotiation packet to the client. Returns false if there's
 // no need for version negotiation.

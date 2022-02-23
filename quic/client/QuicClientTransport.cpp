@@ -1103,6 +1103,12 @@ void QuicClientTransport::getReadBuffer(void** buf, size_t* len) noexcept {
   *len = readBufferSize;
 }
 
+void QuicClientTransport::setReadBuffer(
+    std::unique_ptr<folly::IOBuf> buf) noexcept {
+  DCHECK(conn_) << "trying to receive packets without a connection";
+  readBuffer_ = std::move(buf);
+}
+
 void QuicClientTransport::onDataAvailable(
     const folly::SocketAddress& server,
     size_t len,
