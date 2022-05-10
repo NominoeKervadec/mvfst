@@ -41,6 +41,10 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
     VLOG(2) << prefix_ << "onPacketSent";
   }
 
+  void onDSRPacketSent(size_t pktSize) override {
+    VLOG(2) << prefix_ << "onDSRPacketSent size=" << pktSize;
+  }
+
   void onPacketRetransmission() override {
     VLOG(2) << prefix_ << "onPacketRetransmission";
   }
@@ -80,6 +84,10 @@ class LogQuicStats : public quic::QuicTransportStatsCallback {
 
   void onConnectionRateLimited() override {
     VLOG(2) << prefix_ << "onConnectionRateLimited";
+  }
+
+  void onConnectionWritableBytesLimited() override {
+    VLOG(2) << prefix_ << "onConnectionWritableBytesLimited";
   }
 
   void onNewTokenReceived() override {

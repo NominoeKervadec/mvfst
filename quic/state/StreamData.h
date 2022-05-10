@@ -111,16 +111,12 @@ struct QuicStreamLike {
   // are currently un-acked. Each one represents one StreamFrame that was
   // written. We need to buffer these because these might be retransmitted in
   // the future. These are associated with the starting offset of the buffer.
-  // Note: the offset in the StreamBuffer itself can be >= the offset on which
-  // it is keyed due to partial reliability - when data is skipped the offset
-  // in the StreamBuffer may be incremented, but the keyed offset must remain
-  // the same so it can be removed from the buffer on ACK.
   folly::F14FastMap<uint64_t, std::unique_ptr<StreamBuffer>>
       retransmissionBuffer;
 
   // Tracks intervals which we have received ACKs for. E.g. in the case of all
   // data being acked this would contain one internval from 0 -> the largest
-  // offseet ACKed. This allows us to track which delivery callbacks can be
+  // offset ACKed. This allows us to track which delivery callbacks can be
   // called.
   template <class T>
   using IntervalSetVec = SmallVec<T, 32, uint16_t>;
@@ -141,7 +137,6 @@ struct QuicStreamLike {
   uint64_t currentWriteOffset{0};
 
   // the minimum offset requires retransmit
-  // N.B. used in QUIC partial reliability
   uint64_t minimumRetransmittableOffset{0};
 
   // Offset of the next expected bytes that we need to read from
@@ -149,7 +144,6 @@ struct QuicStreamLike {
   uint64_t currentReadOffset{0};
 
   // the smallest data offset that we expect the peer to send.
-  // N.B. used in QUIC partial reliability
   uint64_t currentReceiveOffset{0};
 
   // Maximum byte offset observed on the stream.
@@ -184,6 +178,53 @@ struct QuicStreamLike {
       std::prev(lossItr)->eof = buf->eof;
     } else {
       lossBuffer.insert(lossItr, std::move(*buf));
+    }
+  }
+
+  void removeFromLossBuffer(uint64_t offset, size_t len, bool eof) {
+    if (lossBuffer.empty() || len == 0) {
+      // Nothing to do.
+      return;
+    }
+    auto lossItr = lossBuffer.begin();
+    for (; lossItr != lossBuffer.end(); lossItr++) {
+      uint64_t lossStartOffset = lossItr->offset;
+      uint64_t lossEndOffset = lossItr->offset + lossItr->data.chainLength();
+      uint64_t removedStartOffset = offset;
+      uint64_t removedEndOffset = offset + len;
+      if (lossStartOffset > removedEndOffset) {
+        return;
+      }
+      // There's two cases. If the removed offset lies within the existing
+      // StreamBuffer then we need to potentially split it and remove that
+      // section. The other case is that the existing StreamBuffer is completely
+      // accounted for by the removed section, in which case it will be removed.
+      // Note that this split/trim logic relies on the fact that insertion into
+      // the loss buffer will merge contiguous elements, thus allowing us to
+      // make these assumptions.
+      if ((removedStartOffset >= lossStartOffset &&
+           removedEndOffset <= lossEndOffset) ||
+          (lossStartOffset >= removedStartOffset &&
+           lossEndOffset <= removedEndOffset)) {
+        size_t amountToSplit = removedStartOffset > lossStartOffset
+            ? removedStartOffset - lossStartOffset
+            : 0;
+        Buf splitBuf = nullptr;
+        if (amountToSplit > 0) {
+          splitBuf = lossItr->data.splitAtMost(amountToSplit);
+          CHECK(splitBuf);
+          lossItr->offset += amountToSplit;
+        }
+        lossItr->offset += lossItr->data.trimStartAtMost(len);
+        if (lossItr->data.empty() && lossItr->eof == eof) {
+          lossBuffer.erase(lossItr);
+        }
+        if (splitBuf) {
+          insertIntoLossBuffer(std::make_unique<StreamBuffer>(
+              std::move(splitBuf), lossStartOffset, false));
+        }
+        return;
+      }
     }
   }
 };

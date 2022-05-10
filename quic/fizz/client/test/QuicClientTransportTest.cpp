@@ -124,10 +124,10 @@ class QuicClientTransportIntegrationTest : public TestWithParam<TestingParams> {
     }));
     transportSettings.zeroRttSourceTokenMatchingPolicy =
         ZeroRttSourceTokenMatchingPolicy::LIMIT_IF_NO_EXACT_MATCH;
+    std::array<uint8_t, kRetryTokenSecretLength> secret;
+    folly::Random::secureRandom(secret.data(), secret.size());
+    transportSettings.retryTokenSecret = secret;
     if (withRetryPacket) {
-      std::array<uint8_t, kRetryTokenSecretLength> secret;
-      folly::Random::secureRandom(secret.data(), secret.size());
-      transportSettings.retryTokenSecret = secret;
       server->setRateLimit([]() { return 0u; }, 1s);
     }
     server->setTransportStatsCallbackFactory(std::move(statsFactory));
@@ -175,6 +175,7 @@ class QuicClientTransportIntegrationTest : public TestWithParam<TestingParams> {
     EXPECT_CALL(*quicStats_, onQuicStreamClosed()).Times(1);
     EXPECT_CALL(*quicStats_, onRead(_)).Times(AtLeast(1));
     EXPECT_CALL(*quicStats_, onWrite(_)).Times(AtLeast(1));
+    EXPECT_CALL(*quicStats_, onConnectionClose(_)).Times(1);
     client->setTransportStatsCallback(quicStats_);
   }
 
@@ -244,7 +245,7 @@ class QuicClientTransportIntegrationTest : public TestWithParam<TestingParams> {
   folly::EventBase eventbase_;
   folly::SocketAddress serverAddr;
   NiceMock<MockConnectionSetupCallback> clientConnSetupCallback;
-  NiceMock<MockConnectionCallbackNew> clientConnCallback;
+  NiceMock<MockConnectionCallback> clientConnCallback;
   NiceMock<MockReadCallback> readCb;
   std::shared_ptr<TestingQuicClientTransport> client;
   std::shared_ptr<fizz::server::FizzServerContext> serverCtx;
@@ -605,6 +606,82 @@ TEST_P(QuicClientTransportIntegrationTest, ZeroRttRetryPacketTest) {
   EXPECT_TRUE(client->getConn().statelessResetToken.has_value());
 }
 
+TEST_P(QuicClientTransportIntegrationTest, NewTokenReceived) {
+  std::string newToken;
+  client->setNewTokenCallback(
+      [&](std::string token) { newToken = std::move(token); });
+  client->start(&clientConnSetupCallback, &clientConnCallback);
+
+  EXPECT_CALL(clientConnSetupCallback, onTransportReady()).WillOnce(Invoke([&] {
+    CHECK(client->getConn().oneRttWriteCipher);
+    eventbase_.terminateLoopSoon();
+  }));
+  eventbase_.loopForever();
+
+  auto streamId = client->createBidirectionalStream().value();
+  auto data = IOBuf::copyBuffer("hello");
+  auto expected = std::shared_ptr<IOBuf>(IOBuf::copyBuffer("echo "));
+  expected->prependChain(data->clone());
+  sendRequestAndResponseAndWait(*expected, data->clone(), streamId, &readCb);
+
+  EXPECT_FALSE(newToken.empty());
+}
+
+TEST_P(QuicClientTransportIntegrationTest, UseNewTokenThenReceiveRetryToken) {
+  std::string newToken;
+  client->setNewTokenCallback(
+      [&](std::string token) { newToken = std::move(token); });
+  client->start(&clientConnSetupCallback, &clientConnCallback);
+
+  EXPECT_CALL(clientConnSetupCallback, onTransportReady()).WillOnce(Invoke([&] {
+    CHECK(client->getConn().oneRttWriteCipher);
+    eventbase_.terminateLoopSoon();
+  }));
+  eventbase_.loopForever();
+
+  auto streamId = client->createBidirectionalStream().value();
+  auto data = IOBuf::copyBuffer("hello");
+  auto expected = std::shared_ptr<IOBuf>(IOBuf::copyBuffer("echo "));
+  expected->prependChain(data->clone());
+  sendRequestAndResponseAndWait(*expected, data->clone(), streamId, &readCb);
+
+  EXPECT_FALSE(newToken.empty());
+
+  /**
+   * At this point we have a valid new token, so we're going to do the
+   * following:
+   * 1. create a new client and set the new token to the one received above
+
+   * 2. create a new server with a rate limit of zero, forcing retry packet (the
+   *    new token will get rejected since the token secrets aren't the same, but
+   *    this doesn't really affect anything for this test)
+   *
+   * 3. connect to the new server, verify that the tokens are non-empty and not
+   *    equal.
+   */
+  client = createClient();
+  client->setNewToken(newToken);
+
+  auto retryServer = createServer(ProcessId::ONE, true);
+  client->getNonConstConn().peerAddress = retryServer->getAddress();
+
+  SCOPE_EXIT {
+    retryServer->shutdown();
+    retryServer = nullptr;
+  };
+
+  client->start(&clientConnSetupCallback, &clientConnCallback);
+
+  EXPECT_CALL(clientConnSetupCallback, onTransportReady()).WillOnce(Invoke([&] {
+    CHECK(client->getConn().oneRttWriteCipher);
+    eventbase_.terminateLoopSoon();
+  }));
+  eventbase_.loopForever();
+
+  EXPECT_FALSE(client->getConn().retryToken.empty());
+  EXPECT_NE(newToken, client->getConn().retryToken);
+}
+
 TEST_P(QuicClientTransportIntegrationTest, TestZeroRttRejection) {
   expectTransportCallbacks();
   auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Client);
@@ -900,7 +977,7 @@ TEST_P(QuicClientTransportIntegrationTest, D6DEnabledTest) {
   eventbase_.loopForever();
 }
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientTransportIntegrationTests,
     QuicClientTransportIntegrationTest,
     ::testing::Values(
@@ -1052,7 +1129,7 @@ TEST_F(QuicClientTransportTest, onNetworkSwitchReplaceNoHandshake) {
 TEST_F(QuicClientTransportTest, SocketClosedDuringOnTransportReady) {
   class ConnectionCallbackThatWritesOnTransportReady
       : public QuicSocket::ConnectionSetupCallback,
-        public QuicSocket::ConnectionCallbackNew {
+        public QuicSocket::ConnectionCallback {
    public:
     explicit ConnectionCallbackThatWritesOnTransportReady(
         std::shared_ptr<QuicSocket> socket)
@@ -1064,22 +1141,21 @@ TEST_F(QuicClientTransportTest, SocketClosedDuringOnTransportReady) {
       onTransportReadyMock();
     }
 
-    GMOCK_METHOD1_(, noexcept, , onFlowControlUpdate, void(StreamId));
-    GMOCK_METHOD1_(, noexcept, , onNewBidirectionalStream, void(StreamId));
-    GMOCK_METHOD1_(, noexcept, , onNewUnidirectionalStream, void(StreamId));
-    GMOCK_METHOD2_(
-        ,
-        noexcept,
-        ,
+    MOCK_METHOD(void, onFlowControlUpdate, (StreamId), (noexcept));
+    MOCK_METHOD(void, onNewBidirectionalStream, (StreamId), (noexcept));
+    MOCK_METHOD(void, onNewUnidirectionalStream, (StreamId), (noexcept));
+    MOCK_METHOD(
+        void,
         onStopSending,
-        void(StreamId, ApplicationErrorCode));
-    GMOCK_METHOD0_(, noexcept, , onTransportReadyMock, void());
-    GMOCK_METHOD0_(, noexcept, , onReplaySafe, void());
-    GMOCK_METHOD0_(, noexcept, , onConnectionEnd, void());
+        (StreamId, ApplicationErrorCode),
+        (noexcept));
+    MOCK_METHOD(void, onTransportReadyMock, (), (noexcept));
+    MOCK_METHOD(void, onReplaySafe, (), (noexcept));
+    MOCK_METHOD(void, onConnectionEnd, (), (noexcept));
     void onConnectionSetupError(QuicError error) noexcept override {
       onConnectionError(std::move(error));
     }
-    GMOCK_METHOD1_(, noexcept, , onConnectionError, void(QuicError));
+    MOCK_METHOD(void, onConnectionError, (QuicError), (noexcept));
 
    private:
     std::shared_ptr<QuicSocket> socket_;
@@ -1962,7 +2038,7 @@ class QuicClientTransportHappyEyeballsTest
   SocketAddress serverAddrV6{"::1", 443};
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientTransportHappyEyeballsTests,
     QuicClientTransportHappyEyeballsTest,
     ::testing::Values(
@@ -2137,7 +2213,7 @@ class QuicClientTransportAfterStartTest
     : public QuicClientTransportAfterStartTestBase,
       public testing::WithParamInterface<uint8_t> {};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientZeroLenConnIds,
     QuicClientTransportAfterStartTest,
     ::Values(0, 8));
@@ -3009,7 +3085,7 @@ class QuicClientTransportAfterStartTestClose
     : public QuicClientTransportAfterStartTestBase,
       public testing::WithParamInterface<bool> {};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientTransportAfterStartTestCloseWithError,
     QuicClientTransportAfterStartTestClose,
     Values(true, false));
@@ -3215,7 +3291,7 @@ class QuicClientTransportAfterStartTestTimeout
     : public QuicClientTransportAfterStartTestBase,
       public testing::WithParamInterface<QuicVersion> {};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientTransportAfterStartTestTimeouts,
     QuicClientTransportAfterStartTestTimeout,
     Values(QuicVersion::MVFST, QuicVersion::QUIC_V1, QuicVersion::QUIC_DRAFT));
@@ -3383,9 +3459,7 @@ TEST_F(QuicClientTransportAfterStartTest, IdleTimerResetNoOutstandingPackets) {
 
   // Clear out all the outstanding packets to simulate quiescent state.
   client->getNonConstConn().receivedNewPacketBeforeWrite = false;
-  client->getNonConstConn().outstandings.packets.clear();
-  client->getNonConstConn().outstandings.packetCount = {};
-  client->getNonConstConn().outstandings.clonedPacketCount = {};
+  client->getNonConstConn().outstandings.reset();
   client->idleTimeout().cancelTimeout();
   auto streamId = client->createBidirectionalStream().value();
   auto expected = folly::IOBuf::copyBuffer("hello");
@@ -5352,7 +5426,7 @@ class QuicProcessDataTest : public QuicClientTransportAfterStartTestBase,
   }
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicClientZeroLenConnIds,
     QuicProcessDataTest,
     ::Values(0, 8));

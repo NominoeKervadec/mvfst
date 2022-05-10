@@ -88,7 +88,7 @@ constexpr uint64_t kDefaultD6DBlackholeDetectionThreshold = 8;
 // 1 means GRO is not enabled
 // 64 is the max possible value
 constexpr uint16_t kMinNumGROBuffers = 1;
-constexpr uint16_t kMaxNumGROBuffers = 16;
+constexpr uint16_t kMaxNumGROBuffers = 64;
 constexpr uint16_t kDefaultNumGROBuffers = kMinNumGROBuffers;
 
 constexpr uint16_t kMaxNumCoalescedPackets = 5;
@@ -120,6 +120,8 @@ BETTER_ENUM(
     uint64_t,
     // Any value not in the list below
     UNKNOWN = 0x0,
+    // No-op
+    NO_OP = 0x1,
     // Disabling pmtu blackhole detection
     ZERO_PMTU_BLACKHOLE_DETECTION = 0x8830,
     // Force udp payload size to be equal to max
@@ -146,7 +148,11 @@ BETTER_ENUM(
     // Enable experimental pacer settings
     PACER_EXPERIMENTAL = 0x5557,
     // Set short header padding modulo size
-    SHORT_HEADER_PADDING_KNOB = 0x6666)
+    SHORT_HEADER_PADDING_KNOB = 0x6666,
+    // Keepalive timer enabled
+    KEEPALIVE_ENABLED = 0x7777,
+    // Remove from loss buffer on spurious loss
+    REMOVE_FROM_LOSS_BUFFER = 0x8888)
 
 enum class FrameType : uint64_t {
   PADDING = 0x00,
@@ -283,6 +289,8 @@ enum class QuicVersion : uint32_t {
   MVFST_EXPERIMENTAL = 0xfaceb00e, // Experimental alias for MVFST
   MVFST_ALIAS = 0xfaceb010,
   MVFST_INVALID = 0xfaceb00f,
+  MVFST_EXPERIMENTAL2 = 0xfaceb011, // Experimental alias for MVFST
+  MVFST_EXPERIMENTAL3 = 0xfaceb013, // Experimental alias for MVFST
 };
 
 using QuicVersionType = std::underlying_type<QuicVersion>::type;
@@ -356,8 +364,9 @@ constexpr folly::StringPiece kCongestionControlBbrTestingStr = "bbr_testing";
 constexpr folly::StringPiece kCongestionControlCopaStr = "copa";
 constexpr folly::StringPiece kCongestionControlCopa2Str = "copa2";
 constexpr folly::StringPiece kCongestionControlNewRenoStr = "newreno";
-constexpr folly::StringPiece kCongestionControlNoneStr = "none";
 constexpr folly::StringPiece kCongestionControlCcpStr = "ccp";
+constexpr folly::StringPiece kCongestionControlStaticCwndStr = "staticcwnd";
+constexpr folly::StringPiece kCongestionControlNoneStr = "none";
 
 constexpr DurationRep kPersistentCongestionThreshold = 3;
 enum class CongestionControlType : uint8_t {
@@ -368,6 +377,7 @@ enum class CongestionControlType : uint8_t {
   BBR,
   BBRTesting,
   CCP,
+  StaticCwnd,
   None,
   // NOTE: MAX should always be at the end
   MAX
@@ -389,10 +399,10 @@ constexpr uint64_t kDefaultMaxCwndInMss = 2000;
 // Max cwnd limit for perf test purpose
 constexpr uint64_t kLargeMaxCwndInMss = 860000;
 
-// When server receives early data attempt without valid source address token,
+// When server receives initial data without valid source address token,
 // server will limit bytes in flight to avoid amplification attack until CFIN
 // is received which proves sender owns the address.
-constexpr uint64_t kLimitedCwndInMss = 3;
+constexpr uint64_t kLimitedCwndInMss = 5;
 
 /* Hybrid slow start: */
 // The first kAckSampling Acks within a RTT round will be used to sample delays
@@ -402,13 +412,9 @@ constexpr uint64_t kLowSsthreshInMss = 16;
 // ACKs within kAckCountingGap are considered closely spaced, i.e., AckTrain
 constexpr std::chrono::microseconds kAckCountingGap(2);
 // Hystart's upper bound for DelayIncrease
-constexpr std::chrono::microseconds kDelayIncreaseUpperBound(8);
+constexpr std::chrono::microseconds kDelayIncreaseUpperBound(16ms);
 // Hystart's lower bound for DelayIncrease
-constexpr std::chrono::microseconds kDelayIncreaseLowerBound(2);
-// Hystart's upper bound for DelayIncrease (Experimental)
-constexpr std::chrono::microseconds kDelayIncreaseUpperBoundExperimental(16ms);
-// Hystart's lower bound for DelayIncrease (Experimental)
-constexpr std::chrono::microseconds kDelayIncreaseLowerBoundExperimental(4ms);
+constexpr std::chrono::microseconds kDelayIncreaseLowerBound(4ms);
 
 /* Cubic */
 // Default cwnd reduction factor:
@@ -532,7 +538,11 @@ constexpr uint64_t kMaxRetryTokenValidMs = 1000 * 60 * 5;
 // Set to 24h
 constexpr uint64_t kMaxNewTokenValidMs = 1000 * 24 * 60 * 60;
 
+// Default limit on active connection ids that a peer generates.
 constexpr uint64_t kDefaultActiveConnectionIdLimit = 2;
+
+// Maximum number of active connection ids to generate for the peer.
+constexpr uint64_t kMaxActiveConnectionIdLimit = 100;
 
 constexpr uint64_t kMaxPacketNumber = (1ull << 62) - 1;
 
@@ -646,5 +656,7 @@ enum class DataPathType : uint8_t {
 // Stream priority level, can only be in [0, 7]
 using PriorityLevel = uint8_t;
 constexpr uint8_t kDefaultMaxPriority = 7;
+
+constexpr size_t kShortHeaderPaddingModulo = 32;
 
 } // namespace quic

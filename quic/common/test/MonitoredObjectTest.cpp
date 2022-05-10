@@ -15,17 +15,17 @@ using namespace std;
 using namespace quic;
 using namespace ::testing;
 
-class MockObserver {
+class MockObjectObserver {
  public:
-  MOCK_METHOD1(accessed, void(const string&));
+  MOCK_METHOD(void, accessed, (const string&));
 };
 
 TEST(MonitoredObjectTest, TestObserverCalled) {
   InSequence s;
   string x = "abc";
-  MockObserver observer;
+  MockObjectObserver observer;
   auto accessFn =
-      std::bind(&MockObserver::accessed, &observer, placeholders::_1);
+      std::bind(&MockObjectObserver::accessed, &observer, placeholders::_1);
   MonitoredObject<string> mo(x, accessFn);
   EXPECT_CALL(observer, accessed(x)).Times(1);
   EXPECT_EQ(x, mo->c_str());

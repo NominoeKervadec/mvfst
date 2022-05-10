@@ -8,6 +8,7 @@
 #pragma once
 
 #include <quic/congestion_control/Bandwidth.h>
+#include <quic/congestion_control/CongestionController.h>
 #include <quic/congestion_control/third_party/windowed_filter.h>
 #include <quic/state/StateData.h>
 #include <quic/state/TransportSettings.h>
@@ -99,6 +100,10 @@ class BbrCongestionController : public CongestionController {
   };
 
   explicit BbrCongestionController(QuicConnectionStateBase& conn);
+  explicit BbrCongestionController(
+      QuicConnectionStateBase& conn,
+      uint64_t cwndBytes,
+      std::chrono::microseconds minRtt);
 
   // TODO: these should probably come in as part of a builder. but I'm not sure
   // if the sampler interface is here to stay atm, so bear with me
@@ -134,6 +139,8 @@ class BbrCongestionController : public CongestionController {
   CongestionControlType type() const noexcept override;
   void setAppIdle(bool idle, TimePoint eventTime) noexcept override;
   void setAppLimited() override;
+
+  void setExperimental(bool experimental) override;
 
   /**
    * Sets a factor of the measured bottleneck BW that the congestion controller
@@ -172,6 +179,8 @@ class BbrCongestionController : public CongestionController {
 
   float cwndGain_{kStartupGain};
   float pacingGain_{kStartupGain};
+  // Whether we have found the bottleneck link bandwidth
+  bool btlbwFound_{false};
 
   QuicConnectionStateBase& conn_;
   BbrState state_{BbrState::Startup};
@@ -236,6 +245,7 @@ class BbrCongestionController : public CongestionController {
   void updateCwnd(uint64_t ackedBytes, uint64_t excessiveBytes) noexcept;
   std::chrono::microseconds minRtt() const noexcept;
 
+  bool isExperimental_{false};
   // Number of round trips the connection has witnessed
   uint64_t roundTripCounter_{0};
   // When a packet with send time later than endOfRoundTrip_ is acked, the
@@ -258,8 +268,6 @@ class BbrCongestionController : public CongestionController {
   std::vector<float> pacingGainCycles_;
   float bandwidthUtilizationFactor_{1.0};
 
-  // Whether we have found the bottleneck link bandwidth
-  bool btlbwFound_{false};
   uint64_t sendQuantum_{0};
 
   Bandwidth previousStartupBandwidth_;

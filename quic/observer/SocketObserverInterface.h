@@ -14,87 +14,35 @@
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/QuicStreamUtilities.h>
 
+#include <utility>
+
 namespace folly {
 class EventBase;
 }
 
 namespace quic {
 class QuicSocket;
-
-/**
- * ===== Observer API =====
- */
+class QuicTransportBase;
 
 /**
  * Observer of socket events.
  */
-class Observer {
+class SocketObserverInterface {
  public:
-  /**
-   * Observer configuration.
-   *
-   * Specifies events observer wants to receive.
-   */
-  struct Config {
-    virtual ~Config() = default;
-
-    // following flags enable support for various callbacks.
-    // observer and socket lifecycle callbacks are always enabled.
-    bool evbEvents{false};
-    bool packetsWrittenEvents{false};
-    bool appRateLimitedEvents{false};
-    bool lossEvents{false};
-    bool spuriousLossEvents{false};
-    bool pmtuEvents{false};
-    bool rttSamples{false};
-    bool knobFrameEvents{false};
-    bool streamEvents{false};
-    bool acksProcessedEvents{false};
-
-    virtual void enableAllEvents() {
-      evbEvents = true;
-      packetsWrittenEvents = true;
-      appRateLimitedEvents = true;
-      rttSamples = true;
-      lossEvents = true;
-      spuriousLossEvents = true;
-      pmtuEvents = true;
-      knobFrameEvents = true;
-      streamEvents = true;
-      acksProcessedEvents = true;
-    }
-
-    /**
-     * Returns a config where all events are enabled.
-     */
-    static Config getConfigAllEventsEnabled() {
-      Config config = {};
-      config.enableAllEvents();
-      return config;
-    }
+  enum class Events {
+    evbEvents = 1,
+    packetsWrittenEvents = 2,
+    appRateLimitedEvents = 3,
+    rttSamples = 4,
+    lossEvents = 5,
+    spuriousLossEvents = 6,
+    pmtuEvents = 7,
+    knobFrameEvents = 8,
+    streamEvents = 9,
+    acksProcessedEvents = 10,
+    packetsReceivedEvents = 11,
   };
-
-  /**
-   * Constructor for observer, uses default config (all callbacks disabled).
-   */
-  Observer() : Observer(Config()) {}
-
-  /**
-   * Constructor for observer.
-   *
-   * @param config      Config, defaults to auxilary instrumentaton disabled.
-   */
-  explicit Observer(const Config& observerConfig)
-      : observerConfig_(observerConfig) {}
-
-  virtual ~Observer() = default;
-
-  /**
-   * Returns observers configuration.
-   */
-  const Config& getConfig() {
-    return observerConfig_;
-  }
+  virtual ~SocketObserverInterface() = default;
 
   struct WriteEvent {
     [[nodiscard]] const std::deque<OutstandingPacket>& getOutstandingPackets()
@@ -108,11 +56,27 @@ class Observer {
     // Monotonically increasing number assigned to each write operation.
     const uint64_t writeCount;
 
+    // Timestamp when packet was last written.
+    const folly::Optional<TimePoint> maybeLastPacketSentTime;
+
+    // CWND in bytes.
+    //
+    // Optional to handle cases where congestion controller not used.
+    const folly::Optional<uint64_t> maybeCwndInBytes;
+
+    // Writable bytes.
+    //
+    // Optional to handle cases where congestion controller not used.
+    const folly::Optional<uint64_t> maybeWritableBytes;
+
     struct BuilderFields {
       folly::Optional<
           std::reference_wrapper<const std::deque<OutstandingPacket>>>
           maybeOutstandingPacketsRef;
       folly::Optional<uint64_t> maybeWriteCount;
+      folly::Optional<TimePoint> maybeLastPacketSentTime;
+      folly::Optional<uint64_t> maybeCwndInBytes;
+      folly::Optional<uint64_t> maybeWritableBytes;
       explicit BuilderFields() = default;
     };
 
@@ -120,18 +84,29 @@ class Observer {
       Builder&& setOutstandingPackets(
           const std::deque<OutstandingPacket>& outstandingPacketsIn);
       Builder&& setWriteCount(const uint64_t writeCountIn);
+      Builder&& setLastPacketSentTime(const TimePoint& lastPacketSentTimeIn);
+      Builder&& setLastPacketSentTime(
+          const folly::Optional<TimePoint>& maybeLastPacketSentTimeIn);
+      Builder&& setCwndInBytes(
+          const folly::Optional<uint64_t>& maybeCwndInBytesIn);
+      Builder&& setWritableBytes(
+          const folly::Optional<uint64_t>& maybeWritableBytesIn);
       WriteEvent build() &&;
       explicit Builder() = default;
     };
 
     // Do not support copy or move given that outstanding packets is a ref.
-    WriteEvent(const WriteEvent&) = delete;
     WriteEvent(WriteEvent&&) = delete;
     WriteEvent& operator=(const WriteEvent&) = delete;
     WriteEvent& operator=(WriteEvent&& rhs) = delete;
 
     // Use builder to construct.
     explicit WriteEvent(const BuilderFields& builderFields);
+
+   protected:
+    // Allow QuicTransportBase to use the copy constructor for enqueuing
+    friend class QuicTransportBase;
+    WriteEvent(const WriteEvent&) = default;
   };
 
   struct AppLimitedEvent : public WriteEvent {
@@ -139,6 +114,13 @@ class Observer {
       Builder&& setOutstandingPackets(
           const std::deque<OutstandingPacket>& outstandingPacketsIn);
       Builder&& setWriteCount(const uint64_t writeCountIn);
+      Builder&& setLastPacketSentTime(const TimePoint& lastPacketSentTimeIn);
+      Builder&& setLastPacketSentTime(
+          const folly::Optional<TimePoint>& maybeLastPacketSentTimeIn);
+      Builder&& setCwndInBytes(
+          const folly::Optional<uint64_t>& maybeCwndInBytesIn);
+      Builder&& setWritableBytes(
+          const folly::Optional<uint64_t>& maybeWritableBytesIn);
       AppLimitedEvent build() &&;
       explicit Builder() = default;
     };
@@ -155,9 +137,13 @@ class Observer {
     // These packets will appear in outstandingPackets.
     const uint64_t numAckElicitingPacketsWritten;
 
+    // Number of bytes written.
+    const uint64_t numBytesWritten;
+
     struct BuilderFields : public WriteEvent::BuilderFields {
       folly::Optional<uint64_t> maybeNumPacketsWritten;
       folly::Optional<uint64_t> maybeNumAckElicitingPacketsWritten;
+      folly::Optional<uint64_t> maybeNumBytesWritten;
       explicit BuilderFields() = default;
     };
 
@@ -165,15 +151,88 @@ class Observer {
       Builder&& setOutstandingPackets(
           const std::deque<OutstandingPacket>& outstandingPacketsIn);
       Builder&& setWriteCount(const uint64_t writeCountIn);
+      Builder&& setLastPacketSentTime(const TimePoint& lastPacketSentTimeIn);
+      Builder&& setLastPacketSentTime(
+          const folly::Optional<TimePoint>& maybeLastPacketSentTimeIn);
       Builder&& setNumPacketsWritten(const uint64_t numPacketsWrittenIn);
       Builder&& setNumAckElicitingPacketsWritten(
           const uint64_t numAckElicitingPacketsWrittenIn);
+      Builder&& setNumBytesWritten(const uint64_t numBytesWrittenIn);
+      Builder&& setCwndInBytes(
+          const folly::Optional<uint64_t>& maybeCwndInBytesIn);
+      Builder&& setWritableBytes(
+          const folly::Optional<uint64_t>& maybeWritableBytesIn);
       PacketsWrittenEvent build() &&;
       explicit Builder() = default;
     };
 
     // Use builder to construct.
     explicit PacketsWrittenEvent(BuilderFields&& builderFields);
+  };
+
+  struct PacketsReceivedEvent {
+    /**
+     * Packet received.
+     */
+    struct ReceivedPacket {
+      // Packet receive timestamp.
+      //
+      // If socket receive (RX) timestamps are used this will be the timestamp
+      // provided by the kernel mapped to the steady_clock timespace and made
+      // later than or equal to previous timestamps.
+      const TimePoint packetReceiveTime;
+
+      // Number of bytes in the received packet.
+      const uint64_t packetNumBytes;
+
+      struct BuilderFields {
+        folly::Optional<TimePoint> maybePacketReceiveTime;
+        folly::Optional<uint64_t> maybePacketNumBytes;
+        explicit BuilderFields() = default;
+      };
+
+      struct Builder : public BuilderFields {
+        Builder&& setPacketReceiveTime(const TimePoint packetReceiveTimeIn);
+        Builder&& setPacketNumBytes(const uint64_t packetNumBytesIn);
+        ReceivedPacket build() &&;
+        explicit Builder() = default;
+      };
+
+      // Use builder to construct.
+      explicit ReceivedPacket(BuilderFields&& builderFields);
+    };
+
+    // Receive loop timestamp.
+    const TimePoint receiveLoopTime;
+
+    // Number of packets received.
+    const uint64_t numPacketsReceived;
+
+    // Number of bytes received.
+    const uint64_t numBytesReceived;
+
+    // Details for each received packet.
+    std::vector<ReceivedPacket> receivedPackets;
+
+    struct BuilderFields {
+      folly::Optional<TimePoint> maybeReceiveLoopTime;
+      folly::Optional<uint64_t> maybeNumPacketsReceived;
+      folly::Optional<uint64_t> maybeNumBytesReceived;
+      std::vector<ReceivedPacket> receivedPackets;
+      explicit BuilderFields() = default;
+    };
+
+    struct Builder : public BuilderFields {
+      Builder&& setReceiveLoopTime(const TimePoint receiveLoopTimeIn);
+      Builder&& setNumPacketsReceived(const uint64_t numPacketsReceivedIn);
+      Builder&& setNumBytesReceived(const uint64_t numBytesReceivedIn);
+      Builder&& addReceivedPacket(ReceivedPacket&& packetIn);
+      PacketsReceivedEvent build() &&;
+      explicit Builder() = default;
+    };
+
+    // Use builder to construct.
+    explicit PacketsReceivedEvent(BuilderFields&& builderFields);
   };
 
   struct AcksProcessedEvent {
@@ -204,10 +263,11 @@ class Observer {
     explicit LostPacket(
         bool lostbytimeout,
         bool lostbyreorder,
-        const quic::OutstandingPacket& pkt)
+        quic::OutstandingPacket pkt)
+
         : lostByTimeout(lostbytimeout),
           lostByReorderThreshold(lostbyreorder),
-          packet(pkt) {}
+          packet(std::move(pkt)) {}
     bool lostByTimeout{false};
     bool lostByReorderThreshold{false};
     const quic::OutstandingPacket packet;
@@ -348,32 +408,6 @@ class Observer {
   using StreamCloseEvent = StreamEvent;
 
   /**
-   * observerAttach() will be invoked when an observer is added.
-   *
-   * @param socket      Socket where observer was installed.
-   */
-  virtual void observerAttach(QuicSocket* /* socket */) noexcept {}
-
-  /**
-   * observerDetach() will be invoked if the observer is uninstalled prior
-   * to socket destruction.
-   *
-   * No further callbacks will be invoked after observerDetach().
-   *
-   * @param socket      Socket where observer was uninstalled.
-   */
-  virtual void observerDetach(QuicSocket* /* socket */) noexcept {}
-
-  /**
-   * destroy() will be invoked when the QuicSocket's destructor is invoked.
-   *
-   * No further callbacks will be invoked after destroy().
-   *
-   * @param socket      Socket being destroyed.
-   */
-  virtual void destroy(QuicSocket* /* socket */) noexcept {}
-
-  /**
    * close() will be invoked when the socket is being closed.
    *
    * If the callback handler does not unsubscribe itself upon being called,
@@ -422,9 +456,9 @@ class Observer {
       const AppLimitedEvent& /* event */) {}
 
   /**
-   * packetsWritten() is invoked when the socket writes packets to the wire.
+   * packetsWritten() is invoked when packets are written to the UDP socket.
    *
-   * @param socket   Socket for which packets were written to the wire.
+   * @param socket   Socket for which packets were written.
    * @param event    PacketsWrittenEvent with details.
    */
   virtual void packetsWritten(
@@ -440,6 +474,16 @@ class Observer {
   virtual void appRateLimited(
       QuicSocket* /* socket */,
       const AppLimitedEvent& /* event */) {}
+
+  /**
+   * packetsReceived() is invoked when raw packets are received from UDP socket.
+   *
+   * @param socket   Socket for which packets were received.
+   * @param event    PacketsReceivedEvent with details.
+   */
+  virtual void packetsReceived(
+      QuicSocket* /* socket */,
+      const PacketsReceivedEvent& /* event */) {}
 
   /**
    * acksProcessed() is invoked when ACKs from remote are processed.
@@ -536,14 +580,6 @@ class Observer {
   virtual void streamClosed(
       QuicSocket*, /* socket */
       const StreamCloseEvent& /* event */) {}
-
- protected:
-  // observer configuration; cannot be changed post instantiation
-  const Config observerConfig_;
 };
-
-// Container for instrumentation observers.
-// Avoids heap allocation for up to 2 observers being installed.
-using ObserverVec = SmallVec<Observer*, 2>;
 
 } // namespace quic

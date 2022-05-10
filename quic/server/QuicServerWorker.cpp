@@ -30,7 +30,15 @@
 #include <quic/server/QuicServerWorker.h>
 #include <quic/server/handshake/StatelessResetGenerator.h>
 #include <quic/server/handshake/TokenGenerator.h>
+#include <quic/server/third-party/siphash.h>
 #include <quic/state/QuicConnectionStats.h>
+
+// This hook is invoked by mvfst for every UDP socket it creates.
+#if FOLLY_HAVE_WEAK_SYMBOLS
+extern "C" FOLLY_ATTR_WEAK void mvfst_hook_on_socket_create(int fd);
+#else
+static void (*mvfst_hook_on_socket_create)(int fd) = nullptr;
+#endif
 
 namespace quic {
 
@@ -180,7 +188,7 @@ const folly::SocketAddress& QuicServerWorker::getAddress() const {
 }
 
 void QuicServerWorker::getReadBuffer(void** buf, size_t* len) noexcept {
-  readBuffer_ = folly::IOBuf::create(
+  readBuffer_ = folly::IOBuf::createCombined(
       transportSettings_.maxRecvPacketSize * numGROBuffers_);
   *buf = readBuffer_->writableData();
   *len = transportSettings_.maxRecvPacketSize * numGROBuffers_;
@@ -701,6 +709,9 @@ void QuicServerWorker::dispatchPacketData(
           trans->setHandshakeFinishedCallback(this);
           trans->setSupportedVersions(supportedVersions_);
           trans->setOriginalPeerAddress(client);
+          if (isValidNewToken) {
+            trans->verifiedClientAddress();
+          }
 #ifdef CCP_ENABLED
           trans->setCcpDatapath(getCcpReader()->getDatapath());
 #endif
@@ -1162,13 +1173,21 @@ void QuicServerWorker::setHealthCheckToken(
 std::unique_ptr<folly::AsyncUDPSocket> QuicServerWorker::makeSocket(
     folly::EventBase* evb) const {
   CHECK(socket_);
-  return socketFactory_->make(evb, socket_->getNetworkSocket().toFd());
+  auto sock = socketFactory_->make(evb, socket_->getNetworkSocket().toFd());
+  if (sock && mvfst_hook_on_socket_create) {
+    mvfst_hook_on_socket_create(sock->getNetworkSocket().toFd());
+  }
+  return sock;
 }
 
 std::unique_ptr<folly::AsyncUDPSocket> QuicServerWorker::makeSocket(
     folly::EventBase* evb,
     int fd) const {
-  return socketFactory_->make(evb, fd);
+  auto sock = socketFactory_->make(evb, fd);
+  if (sock && mvfst_hook_on_socket_create) {
+    mvfst_hook_on_socket_create(sock->getNetworkSocket().toFd());
+  }
+  return sock;
 }
 
 const QuicServerWorker::ConnIdToTransportMap&
@@ -1236,10 +1255,6 @@ void QuicServerWorker::onConnectionUnbound(
   transport->setRoutingCallback(nullptr);
   boundServerTransports_.erase(transport);
 
-  if (connectionIdData.size()) {
-    QUIC_STATS(statsCallback_, onConnectionClose, folly::none);
-  }
-
   for (auto& connId : connectionIdData) {
     VLOG(4) << fmt::format(
         "Removing CID from connectionIdMap_, routingInfo={}",
@@ -1251,7 +1266,7 @@ void QuicServerWorker::onConnectionUnbound(
     // still hold a pointer to the incorrect transport.
     QuicServerTransport* incorrectTransportPtr = nullptr;
     if (it == connectionIdMap_.end()) {
-      LOG(ERROR) << "CID not found in connectionIdMap_ CID= " << connId.connId;
+      VLOG(3) << "CID not found in connectionIdMap_ CID= " << connId.connId;
     } else {
       QuicServerTransport* existingPtr = it->second.get();
       if (existingPtr != transport) {
@@ -1316,7 +1331,6 @@ void QuicServerWorker::shutdownAllConnections(LocalErrorCode error) {
       t->setHandshakeFinishedCallback(nullptr);
       t->closeNow(
           QuicError(QuicErrorCode(error), std::string("shutting down")));
-      QUIC_STATS(statsCallback_, onConnectionClose, QuicErrorCode(error));
     }
   }
   sourceAddressMap_.clear();
@@ -1431,6 +1445,37 @@ void QuicServerWorker::getAllConnectionsStats(
     connStats.numConnIDs = connEntry.second;
     stats.emplace_back(connStats);
   }
+}
+
+size_t QuicServerWorker::SourceIdentityHash::operator()(
+    const QuicServerTransport::SourceIdentity& sid) const {
+  static const ::siphash::Key hashKey(
+      folly::Random::secureRandom<std::uint64_t>(),
+      folly::Random::secureRandom<std::uint64_t>());
+
+  // We opt to manually lay out the key in order to ensure that our key
+  // has a unique object representation. (i.e. no padding).
+  //
+  // (sockaddr, quic connection id, port)
+  constexpr size_t kKeySize =
+      sizeof(struct sockaddr_storage) + kMaxConnectionIdSize + sizeof(uint16_t);
+
+  // Zero initialization is intentional here.
+  std::array<unsigned char, kKeySize> key{};
+
+  struct sockaddr_storage* storage =
+      reinterpret_cast<struct sockaddr_storage*>(key.data());
+  const auto& sockaddr = sid.first;
+  sockaddr.getAddress(storage);
+
+  unsigned char* connid = key.data() + sizeof(struct sockaddr_storage);
+  memcpy(connid, sid.second.data(), sid.second.size());
+
+  uint16_t* port = reinterpret_cast<uint16_t*>(
+      key.data() + sizeof(struct sockaddr_storage) + kMaxConnectionIdSize);
+  *port = sid.first.getPort();
+
+  return siphash::siphash24(key.data(), key.size(), &hashKey);
 }
 
 } // namespace quic

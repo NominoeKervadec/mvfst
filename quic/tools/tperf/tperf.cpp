@@ -139,12 +139,14 @@ ProbeSizeRaiserType parseRaiserType(uint32_t type) {
   }
 }
 
-class TPerfObserver : public Observer {
+class TPerfObserver : public LegacyObserver {
  public:
-  TPerfObserver(const Observer::Config& config) : Observer(config) {}
+  using LegacyObserver::LegacyObserver;
+
   void appRateLimited(
       QuicSocket* /* socket */,
-      const quic::Observer::AppLimitedEvent& /* appLimitedEvent */) override {
+      const quic::SocketObserverInterface::
+          AppLimitedEvent& /* appLimitedEvent */) override {
     if (FLAGS_log_app_rate_limited) {
       LOG(INFO) << "appRateLimited detected";
     }
@@ -200,12 +202,13 @@ class TPerfAcceptObserver : public AcceptObserver {
   TPerfAcceptObserver() {
     // Create an observer config, only enabling events we are interested in
     // receiving.
-    Observer::Config config = {};
-    config.appRateLimitedEvents = true;
-    config.pmtuEvents = true;
-    config.rttSamples = true;
-    config.lossEvents = true;
-    tperfObserver_ = std::make_unique<TPerfObserver>(config);
+    LegacyObserver::EventSet eventSet;
+    eventSet.enable(
+        SocketObserverInterface::Events::appRateLimitedEvents,
+        SocketObserverInterface::Events::pmtuEvents,
+        SocketObserverInterface::Events::rttSamples,
+        SocketObserverInterface::Events::lossEvents);
+    tperfObserver_ = std::make_unique<TPerfObserver>(eventSet);
   }
 
   void accept(QuicTransportBase* transport) noexcept override {
@@ -231,7 +234,7 @@ class TPerfAcceptObserver : public AcceptObserver {
 } // namespace
 
 class ServerStreamHandler : public quic::QuicSocket::ConnectionSetupCallback,
-                            public quic::QuicSocket::ConnectionCallbackNew,
+                            public quic::QuicSocket::ConnectionCallback,
                             public quic::QuicSocket::ReadCallback,
                             public quic::QuicSocket::WriteCallback {
  public:
@@ -568,7 +571,7 @@ class TPerfServer {
 };
 
 class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
-                    public quic::QuicSocket::ConnectionCallbackNew,
+                    public quic::QuicSocket::ConnectionCallback,
                     public quic::QuicSocket::ReadCallback,
                     public quic::QuicSocket::WriteCallback,
                     public folly::HHWheelTimer::Callback {
@@ -727,7 +730,8 @@ class TPerfClient : public quic::QuicSocket::ConnectionSetupCallback,
     settings.shouldUseRecvmmsgForBatchRecv = true;
     settings.maxRecvBatchSize = 32;
     settings.defaultCongestionController = congestionControlType_;
-    if (congestionControlType_ == quic::CongestionControlType::BBR) {
+    if (congestionControlType_ == quic::CongestionControlType::BBR ||
+        congestionControlType_ == CongestionControlType::BBRTesting) {
       settings.pacingEnabled = true;
       settings.pacingTimerTickInterval = 200us;
     }

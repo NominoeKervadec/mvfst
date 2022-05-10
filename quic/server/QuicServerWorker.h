@@ -7,14 +7,18 @@
 
 #pragma once
 
+#include <folly/Random.h>
 #include <folly/container/EvictingCacheMap.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/small_vector.h>
+#include <cstdint>
+#include <type_traits>
 
 #include <quic/codec/ConnectionIdAlgo.h>
+#include <quic/codec/QuicConnectionId.h>
 #include <quic/common/BufAccessor.h>
 #include <quic/common/Timers.h>
 #include <quic/congestion_control/CongestionControllerFactory.h>
@@ -391,11 +395,7 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
       F14FastMap<ConnectionId, QuicServerTransport::Ptr, ConnectionIdHash>;
 
   struct SourceIdentityHash {
-    size_t operator()(const QuicServerTransport::SourceIdentity& sid) const {
-      return folly::hash::hash_combine(
-          folly::hash::fnv32_buf(sid.second.data(), sid.second.size()),
-          sid.first.hash());
-    }
+    size_t operator()(const QuicServerTransport::SourceIdentity& sid) const;
   };
   using SrcToTransportMap = folly::F14FastMap<
       QuicServerTransport::SourceIdentity,

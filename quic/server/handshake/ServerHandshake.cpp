@@ -206,8 +206,10 @@ void ServerHandshake::addProcessingActions(fizz::server::AsyncActions actions) {
 void ServerHandshake::startActions(fizz::server::AsyncActions actions) {
   folly::variant_match(
       actions,
-      [this](folly::Future<fizz::server::Actions>& futureActions) {
-        std::move(futureActions).then(&ServerHandshake::processActions, this);
+      [this](folly::SemiFuture<fizz::server::Actions>& futureActions) {
+        std::move(futureActions)
+            .via(executor_)
+            .then(&ServerHandshake::processActions, this);
       },
       [this](fizz::server::Actions& immediateActions) {
         this->processActions(std::move(immediateActions));
@@ -349,6 +351,8 @@ class ServerHandshake::ActionMoveVisitor : public boost::static_visitor<> {
             server_.computeCiphers(
                 CipherKind::HandshakeWrite,
                 folly::range(secretAvailable.secret.secret));
+            break;
+          case fizz::HandshakeSecrets::ECHAcceptConfirmation:
             break;
         }
         break;

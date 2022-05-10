@@ -87,6 +87,17 @@ void writeCryptoDataProbesToSocketForTest(
       version);
 }
 
+RegularQuicWritePacket stripPaddingFrames(RegularQuicWritePacket packet) {
+  RegularQuicWritePacket::Vec trimmedFrames{};
+  for (auto frame : packet.frames) {
+    if (!frame.asPaddingFrame()) {
+      trimmedFrames.push_back(frame);
+    }
+  }
+  packet.frames = trimmedFrames;
+  return packet;
+}
+
 auto buildEmptyPacket(
     QuicServerConnectionState& conn,
     PacketNumberSpace pnSpace,
@@ -2959,6 +2970,10 @@ TEST_F(QuicTransportFunctionsTest, WriteProbingNewData) {
   auto currentPacketSeqNum = conn->ackStates.appDataAckState.nextPacketNum;
   auto mockCongestionController =
       std::make_unique<NiceMock<MockCongestionController>>();
+  // Probing data is not limited by congestion control, this should not affect
+  // anything
+  EXPECT_CALL(*mockCongestionController, getWritableBytes())
+      .WillRepeatedly(Return(0));
   auto rawCongestionController = mockCongestionController.get();
   conn->congestionController = std::move(mockCongestionController);
   EventBase evb;
@@ -3048,6 +3063,10 @@ TEST_F(QuicTransportFunctionsTest, WriteProbingCryptoData) {
   // Replace real congestionController with MockCongestionController:
   auto mockCongestionController =
       std::make_unique<NiceMock<MockCongestionController>>();
+  // Probing data is not limited by congestion control, this should not affect
+  // anything
+  EXPECT_CALL(*mockCongestionController, getWritableBytes())
+      .WillRepeatedly(Return(0));
   auto rawCongestionController = mockCongestionController.get();
   conn.congestionController = std::move(mockCongestionController);
   EventBase evb;
@@ -3069,6 +3088,54 @@ TEST_F(QuicTransportFunctionsTest, WriteProbingCryptoData) {
       }));
   writeCryptoDataProbesToSocketForTest(
       *rawSocket, conn, 1, *aead, *headerCipher, getVersion(conn));
+  EXPECT_LT(currentPacketSeqNum, conn.ackStates.initialAckState.nextPacketNum);
+  EXPECT_FALSE(conn.outstandings.packets.empty());
+  EXPECT_TRUE(conn.pendingEvents.setLossDetectionAlarm);
+  EXPECT_GT(cryptoStream->currentWriteOffset, currentStreamWriteOffset);
+  EXPECT_FALSE(cryptoStream->retransmissionBuffer.empty());
+}
+
+TEST_F(QuicTransportFunctionsTest, WriteableBytesLimitedProbingCryptoData) {
+  QuicServerConnectionState conn(
+      FizzServerQuicHandshakeContext::Builder().build());
+  conn.statsCallback = quicStats_.get();
+  conn.transportSettings.enableWritableBytesLimit = true;
+  conn.writableBytesLimit = 2 * conn.udpSendPacketLen;
+
+  conn.serverConnectionId = getTestConnectionId();
+  conn.clientConnectionId = getTestConnectionId();
+  // writeCryptoDataProbesToSocketForTest writes Initial LongHeader, thus it
+  // writes at Initial level.
+  auto currentPacketSeqNum = conn.ackStates.initialAckState.nextPacketNum;
+  // Replace real congestionController with MockCongestionController:
+  auto mockCongestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  auto rawCongestionController = mockCongestionController.get();
+  conn.congestionController = std::move(mockCongestionController);
+  EventBase evb;
+  auto socket =
+      std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&evb);
+  auto rawSocket = socket.get();
+  auto cryptoStream = &conn.cryptoState->initialStream;
+  uint8_t probesToSend = 4;
+  auto buf = buildRandomInputData(conn.udpSendPacketLen * probesToSend);
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited())
+      .Times(AtLeast(1));
+  writeDataToQuicStream(*cryptoStream, buf->clone());
+
+  auto currentStreamWriteOffset = cryptoStream->currentWriteOffset;
+  EXPECT_CALL(*rawCongestionController, onPacketSent(_)).Times(2);
+  EXPECT_CALL(*rawSocket, write(_, _))
+      .WillRepeatedly(Invoke([&](const SocketAddress&,
+                                 const std::unique_ptr<folly::IOBuf>& iobuf) {
+        auto len = iobuf->computeChainDataLength();
+        EXPECT_EQ(conn.udpSendPacketLen - aead->getCipherOverhead(), len);
+        return len;
+      }));
+  writeCryptoDataProbesToSocketForTest(
+      *rawSocket, conn, probesToSend, *aead, *headerCipher, getVersion(conn));
+
+  EXPECT_EQ(conn.numProbesWritableBytesLimited, 1);
   EXPECT_LT(currentPacketSeqNum, conn.ackStates.initialAckState.nextPacketNum);
   EXPECT_FALSE(conn.outstandings.packets.empty());
   EXPECT_TRUE(conn.pendingEvents.setLossDetectionAlarm);
@@ -4018,7 +4085,8 @@ TEST_F(QuicTransportFunctionsTest, ProbeWriteNewFunctionalFrames) {
       getVersion(*conn),
       1 /* limit to 1 packet */);
   EXPECT_EQ(2, conn->outstandings.packets.size());
-  EXPECT_EQ(1, conn->outstandings.packets[1].packet.frames.size());
+  auto packet = stripPaddingFrames(conn->outstandings.packets[1].packet);
+  EXPECT_EQ(1, packet.frames.size());
   EXPECT_EQ(
       QuicWriteFrame::Type::MaxDataFrame,
       conn->outstandings.packets[1].packet.frames[0].type());

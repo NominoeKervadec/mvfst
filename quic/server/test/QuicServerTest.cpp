@@ -72,7 +72,7 @@ TEST_F(SimpleQuicServerWorkerTest, RejectCid) {
       std::make_unique<folly::test::MockAsyncUDPSocket>(&eventbase_);
   EXPECT_CALL(*mockSock, address()).WillRepeatedly(ReturnRef(addr));
   MockConnectionSetupCallback mockConnectionSetupCallback;
-  MockConnectionCallbackNew mockConnectionCallback;
+  MockConnectionCallback mockConnectionCallback;
   MockQuicTransport::Ptr transportPtr = std::make_shared<MockQuicTransport>(
       &eventbase_,
       std::move(mockSock),
@@ -170,7 +170,7 @@ class QuicServerWorkerTest : public Test {
     EXPECT_CALL(*socketFactory_, _make(_, _)).WillRepeatedly(Return(nullptr));
     worker_->setNewConnectionSocketFactory(socketFactory_.get());
     NiceMock<MockConnectionSetupCallback> connSetupCb;
-    NiceMock<MockConnectionCallbackNew> connCb;
+    NiceMock<MockConnectionCallback> connCb;
     std::unique_ptr<folly::test::MockAsyncUDPSocket> mockSock =
         std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(
             &eventbase_);
@@ -547,7 +547,7 @@ TEST_F(QuicServerWorkerTest, RateLimit) {
   EXPECT_CALL(*quicStats_, onConnectionRateLimited()).Times(1);
 
   NiceMock<MockConnectionSetupCallback> connSetupCb1;
-  NiceMock<MockConnectionCallbackNew> connCb1;
+  NiceMock<MockConnectionCallback> connCb1;
   auto mockSock1 =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock1, address()).WillRepeatedly(ReturnRef(fakeAddress_));
@@ -584,7 +584,7 @@ TEST_F(QuicServerWorkerTest, RateLimit) {
 
   auto caddr2 = folly::SocketAddress("2.3.4.5", 1234);
   NiceMock<MockConnectionSetupCallback> connSetupCb2;
-  NiceMock<MockConnectionCallbackNew> connCb2;
+  NiceMock<MockConnectionCallback> connCb2;
   auto mockSock2 =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock2, address()).WillRepeatedly(ReturnRef(caddr2));
@@ -643,7 +643,7 @@ TEST_F(QuicServerWorkerTest, UnfinishedHandshakeLimit) {
   EXPECT_CALL(*quicStats_, onConnectionRateLimited()).Times(1);
 
   NiceMock<MockConnectionSetupCallback> connSetupCb1;
-  NiceMock<MockConnectionCallbackNew> connCb1;
+  NiceMock<MockConnectionCallback> connCb1;
   auto mockSock1 =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock1, address()).WillRepeatedly(ReturnRef(fakeAddress_));
@@ -679,7 +679,7 @@ TEST_F(QuicServerWorkerTest, UnfinishedHandshakeLimit) {
 
   auto caddr2 = folly::SocketAddress("2.3.4.5", 1234);
   NiceMock<MockConnectionSetupCallback> connSetupCb2;
-  NiceMock<MockConnectionCallbackNew> connCb2;
+  NiceMock<MockConnectionCallback> connCb2;
   auto mockSock2 =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock2, address()).WillRepeatedly(ReturnRef(caddr2));
@@ -734,7 +734,7 @@ TEST_F(QuicServerWorkerTest, UnfinishedHandshakeLimit) {
   worker_->onHandshakeFinished();
   auto caddr4 = folly::SocketAddress("4.3.4.5", 1234);
   NiceMock<MockConnectionSetupCallback> connSetupCb4;
-  NiceMock<MockConnectionCallbackNew> connCb4;
+  NiceMock<MockConnectionCallback> connCb4;
   auto mockSock4 =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock4, address()).WillRepeatedly(ReturnRef(caddr4));
@@ -860,7 +860,7 @@ TEST_F(QuicServerWorkerTest, TestRetryInvalidInitialDstConnId) {
 
 TEST_F(QuicServerWorkerTest, QuicServerWorkerUnbindBeforeCidAvailable) {
   NiceMock<MockConnectionSetupCallback> connSetupCb;
-  NiceMock<MockConnectionCallbackNew> connCb;
+  NiceMock<MockConnectionCallback> connCb;
   auto mockSock =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
   EXPECT_CALL(*mockSock, address()).WillRepeatedly(ReturnRef(fakeAddress_));
@@ -959,7 +959,6 @@ TEST_F(QuicServerWorkerTest, QuicServerMultipleConnIdsRouting) {
       folly::none);
   eventbase_.loop();
 
-  EXPECT_CALL(*quicStats_, onConnectionClose(_)).Times(1);
   EXPECT_CALL(*transport_, setRoutingCallback(nullptr));
   worker_->onConnectionUnbound(
       transport_.get(),
@@ -1041,7 +1040,7 @@ TEST_F(QuicServerWorkerTest, QuicServerNewConnection) {
   ConnectionId connId2({2, 4, 5, 6});
   folly::SocketAddress clientAddr2("2.3.4.5", 2345);
   NiceMock<MockConnectionSetupCallback> connSetupCb;
-  NiceMock<MockConnectionCallbackNew> connCb;
+  NiceMock<MockConnectionCallback> connCb;
   auto mockSock =
       std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(&eventbase_);
 
@@ -1075,7 +1074,6 @@ TEST_F(QuicServerWorkerTest, QuicServerNewConnection) {
       folly::none);
   eventbase_.loop();
 
-  EXPECT_CALL(*quicStats_, onConnectionClose(_)).Times(2);
   EXPECT_CALL(*transport_, setRoutingCallback(nullptr)).Times(2);
   worker_->onConnectionUnbound(
       transport_.get(),
@@ -1344,7 +1342,6 @@ TEST_F(QuicServerWorkerTest, ShutdownQuicServer) {
   const auto& connIdMap = worker_->getConnectionIdMap();
   EXPECT_EQ(connIdMap.count(getTestConnectionId(hostId_)), 1);
 
-  EXPECT_CALL(*quicStats_, onConnectionClose(_));
   EXPECT_CALL(*transport_, setRoutingCallback(nullptr)).Times(2);
   EXPECT_CALL(*transport_, setTransportStatsCallback(nullptr)).Times(2);
   EXPECT_CALL(*transport_, close(_)).WillRepeatedly(Invoke([this](auto) {
@@ -1384,7 +1381,6 @@ TEST_F(QuicServerWorkerTest, DestroyQuicServer) {
   const auto& connIdMap = worker_->getConnectionIdMap();
   EXPECT_EQ(connIdMap.count(getTestConnectionId(hostId_)), 1);
 
-  EXPECT_CALL(*quicStats_, onConnectionClose(_));
   EXPECT_CALL(*transport_, setRoutingCallback(nullptr)).Times(2);
   EXPECT_CALL(*transport_, setTransportStatsCallback(nullptr)).Times(2);
   EXPECT_CALL(*transport_, setHandshakeFinishedCallback(nullptr)).Times(2);
@@ -1417,10 +1413,10 @@ TEST_F(QuicServerWorkerTest, AssignBufAccessor) {
 
 class MockAcceptObserver : public AcceptObserver {
  public:
-  GMOCK_METHOD1_(, noexcept, , accept, void(QuicTransportBase* const));
-  GMOCK_METHOD1_(, noexcept, , acceptorDestroy, void(QuicServerWorker*));
-  GMOCK_METHOD1_(, noexcept, , observerAttach, void(QuicServerWorker*));
-  GMOCK_METHOD1_(, noexcept, , observerDetach, void(QuicServerWorker*));
+  MOCK_METHOD(void, accept, (QuicTransportBase* const), (noexcept));
+  MOCK_METHOD(void, acceptorDestroy, (QuicServerWorker*), (noexcept));
+  MOCK_METHOD(void, observerAttach, (QuicServerWorker*), (noexcept));
+  MOCK_METHOD(void, observerDetach, (QuicServerWorker*), (noexcept));
 };
 
 TEST_F(QuicServerWorkerTest, AcceptObserver) {
@@ -1430,7 +1426,7 @@ TEST_F(QuicServerWorkerTest, AcceptObserver) {
 
   auto initTestSocketAndTransport = [this]() {
     NiceMock<MockConnectionSetupCallback> connSetupCb;
-    NiceMock<MockConnectionCallbackNew> connCb;
+    NiceMock<MockConnectionCallback> connCb;
     auto mockSock = std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(
         &eventbase_);
     EXPECT_CALL(*mockSock, address()).WillRepeatedly(ReturnRef(fakeAddress_));
@@ -2092,7 +2088,7 @@ class QuicServerTest : public Test {
     std::shared_ptr<MockQuicTransport> transport;
     eventBase->runInEventBaseThreadAndWait([&] {
       NiceMock<MockConnectionSetupCallback> connSetupcb;
-      NiceMock<MockConnectionCallbackNew> connCb;
+      NiceMock<MockConnectionCallback> connCb;
       std::unique_ptr<folly::test::MockAsyncUDPSocket> mockSock =
           std::make_unique<NiceMock<folly::test::MockAsyncUDPSocket>>(
               eventBase);
@@ -2371,7 +2367,7 @@ class QuicServerTakeoverTest : public Test {
       folly::Baton<>& baton) {
     std::shared_ptr<MockQuicTransport> transport;
     NiceMock<MockConnectionSetupCallback> connSetupCb;
-    NiceMock<MockConnectionCallbackNew> connCb;
+    NiceMock<MockConnectionCallback> connCb;
     auto makeTransport =
         [&](folly::EventBase* eventBase,
             std::unique_ptr<folly::AsyncUDPSocket>& socket,
@@ -2939,7 +2935,7 @@ TEST_F(QuicServerTest, ZeroRttPacketRoute) {
   setUpTransportFactoryForWorkers(evbs);
   std::shared_ptr<MockQuicTransport> transport;
   NiceMock<MockConnectionSetupCallback> connSetupCb;
-  NiceMock<MockConnectionCallbackNew> connCb;
+  NiceMock<MockConnectionCallback> connCb;
   folly::Baton<> b;
   // create payload
   StreamId id = 1;
@@ -3034,7 +3030,7 @@ TEST_F(QuicServerTest, ZeroRttBeforeInitial) {
   setUpTransportFactoryForWorkers(evbs);
   std::shared_ptr<MockQuicTransport> transport;
   NiceMock<MockConnectionSetupCallback> connSetupCb;
-  NiceMock<MockConnectionCallbackNew> connCb;
+  NiceMock<MockConnectionCallback> connCb;
   folly::Baton<> b;
   // create payload
   StreamId id = 1;

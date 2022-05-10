@@ -78,9 +78,11 @@ class CopaTest : public Test {
     auto ack = AckEvent::Builder()
                    .setAckTime(ackTime)
                    .setAdjustedAckTime(ackTime)
+                   .setAckDelay(0us)
                    .setPacketNumberSpace(PacketNumberSpace::AppData)
+                   .setLargestAckedPacket(largestAcked)
                    .build();
-    ack.largestAckedPacket = largestAcked;
+    ack.largestNewlyAckedPacket = largestAcked;
     ack.ackedBytes = ackedSize;
     ack.ackedPackets.push_back(makeAckPacketFromOutstandingPacket(createPacket(
         largestAcked,
@@ -549,7 +551,9 @@ TEST_F(CopaTest, NoLargestAckedPacketNoCrash) {
   auto ack = AckEvent::Builder()
                  .setAckTime(now)
                  .setAdjustedAckTime(now)
+                 .setAckDelay(0us)
                  .setPacketNumberSpace(PacketNumberSpace::AppData)
+                 .setLargestAckedPacket(1)
                  .build();
   copa.onPacketAckOrLoss(ack, loss);
 

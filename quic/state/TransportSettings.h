@@ -278,7 +278,7 @@ struct TransportSettings {
   // in a packet is always an increment of paddingModulo, hiding the actual
   // packet size from packet analysis.
   // Padding Modulo of 0 turns off padding for short header packets.
-  size_t paddingModulo{0};
+  size_t paddingModulo{kShortHeaderPaddingModulo};
   // Whether to use adaptive loss thresholds for reodering and timeout
   bool useAdaptiveLossThresholds{false};
   // Whether to automatically increase receive conn flow control. The
@@ -286,6 +286,15 @@ struct TransportSettings {
   // updates. If there has been less than 2SRTTs between flow control updates
   // this will double the target window.
   bool autotuneReceiveConnFlowControl{false};
+  // Enable a keepalive timer. This schedules a timer to send a PING ~15%
+  // before an idle timeout. To work effectively this means the idle timer
+  // has to be set to something >> the RTT of the connection.
+  bool enableKeepalive{false};
+  std::string flowPriming = "";
+  // Whether or not to enable WritableBytes limit (server only)
+  bool enableWritableBytesLimit{false};
+  // Whether or not to remove data from the loss buffer on spurious loss.
+  bool removeFromLossBufferOnSpurious{false};
 };
 
 } // namespace quic

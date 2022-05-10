@@ -45,13 +45,13 @@ class TestingQuicClientTransport : public QuicClientTransport {
       std::unique_ptr<folly::AsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connIdSize = kDefaultConnectionIdSize,
-      bool useSplitConnectionCallbacks = false)
+      bool useConnectionEndWithErrorCallback = false)
       : QuicClientTransport(
             evb,
             std::move(socket),
             std::move(handshakeFactory),
             connIdSize,
-            useSplitConnectionCallbacks) {}
+            useConnectionEndWithErrorCallback) {}
 
   ~TestingQuicClientTransport() override {
     if (destructionCallback_) {
@@ -540,7 +540,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
     return clientConnSetupCallback;
   }
 
-  MockConnectionCallbackNew& getConnCallback() {
+  MockConnectionCallback& getConnCallback() {
     return clientConnCallback;
   }
 
@@ -882,7 +882,7 @@ class QuicClientTransportTestBase : public virtual testing::Test {
   testing::NiceMock<MockDeliveryCallback> deliveryCallback;
   testing::NiceMock<MockReadCallback> readCb;
   testing::NiceMock<MockConnectionSetupCallback> clientConnSetupCallback;
-  testing::NiceMock<MockConnectionCallbackNew> clientConnCallback;
+  testing::NiceMock<MockConnectionCallback> clientConnCallback;
   folly::test::MockAsyncUDPSocket* sock;
   std::shared_ptr<TestingQuicClientTransport::DestructionCallback>
       destructionCallback;

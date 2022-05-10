@@ -96,45 +96,18 @@ RegularQuicPacketBuilder::Packet createAckPacket(
     PacketNum pn,
     AckBlocks& acks,
     PacketNumberSpace pnSpace,
-    const Aead* aead) {
-  // This function sends ACK to dstConn
-  auto srcConnId =
-      (dstConn.nodeType == QuicNodeType::Client ? *dstConn.serverConnectionId
-                                                : *dstConn.clientConnectionId);
-  auto dstConnId =
-      (dstConn.nodeType == QuicNodeType::Client ? *dstConn.clientConnectionId
-                                                : *dstConn.serverConnectionId);
-  folly::Optional<PacketHeader> header;
-  if (pnSpace == PacketNumberSpace::Initial) {
-    header = LongHeader(
-        LongHeader::Types::Initial,
-        srcConnId,
-        dstConnId,
-        pn,
-        QuicVersion::MVFST);
-  } else if (pnSpace == PacketNumberSpace::Handshake) {
-    header = LongHeader(
-        LongHeader::Types::Handshake,
-        srcConnId,
-        dstConnId,
-        pn,
-        QuicVersion::MVFST);
-  } else {
-    header = ShortHeader(ProtectionType::KeyPhaseZero, dstConnId, pn);
-  }
-  RegularQuicPacketBuilder builder(
-      dstConn.udpSendPacketLen,
-      std::move(*header),
-      getAckState(dstConn, pnSpace).largestAckScheduled.value_or(0));
-  builder.encodePacketHeader();
+    const Aead* aead,
+    std::chrono::microseconds ackDelay) {
+  auto builder = AckPacketBuilder()
+                     .setDstConn(&dstConn)
+                     .setPacketNumberSpace(pnSpace)
+                     .setAckPacketNum(pn)
+                     .setAckBlocks(acks)
+                     .setAckDelay(ackDelay);
   if (aead) {
-    builder.accountForCipherOverhead(aead->getCipherOverhead());
+    builder.setAead(aead);
   }
-  DCHECK(builder.canBuildPacket());
-  AckFrameMetaData ackData(
-      acks, 0us, dstConn.transportSettings.ackDelayExponent);
-  writeAckFrame(ackData, builder);
-  return std::move(builder).buildPacket();
+  return std::move(builder).build();
 }
 
 std::shared_ptr<fizz::SelfCert> readCert() {
@@ -162,7 +135,7 @@ class AcceptingTicketCipher : public fizz::server::TicketCipher {
  public:
   ~AcceptingTicketCipher() override = default;
 
-  folly::Future<folly::Optional<
+  folly::SemiFuture<folly::Optional<
       std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>
   encrypt(fizz::server::ResumptionState) const override {
     // Fake handshake, no need todo anything here.
@@ -199,7 +172,7 @@ class AcceptingTicketCipher : public fizz::server::TicketCipher {
     return resState;
   }
 
-  folly::Future<
+  folly::SemiFuture<
       std::pair<fizz::PskType, folly::Optional<fizz::server::ResumptionState>>>
   decrypt(std::unique_ptr<folly::IOBuf>) const override {
     return std::make_pair(fizz::PskType::Resumption, createResumptionState());
@@ -568,11 +541,13 @@ CongestionController::AckEvent makeAck(
   auto ack = AckEvent::Builder()
                  .setAckTime(ackedTime)
                  .setAdjustedAckTime(ackedTime)
+                 .setAckDelay(0us)
                  .setPacketNumberSpace(PacketNumberSpace::AppData)
+                 .setLargestAckedPacket(seq)
                  .build();
 
   ack.ackedBytes = ackedSize;
-  ack.largestAckedPacket = seq;
+  ack.largestNewlyAckedPacket = seq;
   ack.ackedPackets.emplace_back(
       CongestionController::AckEvent::AckPacket::Builder()
           .setPacketNum(seq)
@@ -591,7 +566,7 @@ CongestionController::AckEvent makeAck(
               OutstandingPacketMetadata::DetailsPerStream()))
           .setDetailsPerStream(AckEvent::AckPacket::DetailsPerStream())
           .build());
-  ack.largestAckedPacketSentTime = sentTime;
+  ack.largestNewlyAckedPacketSentTime = sentTime;
   return ack;
 }
 

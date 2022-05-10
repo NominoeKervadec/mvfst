@@ -45,10 +45,12 @@ class Copa2Test : public Test {
     auto ackEvent = AckEvent::Builder()
                         .setAckTime(ackTime)
                         .setAdjustedAckTime(ackTime)
+                        .setAckDelay(0us)
                         .setImplicit(false)
                         .setPacketNumberSpace(PacketNumberSpace::AppData)
+                        .setLargestAckedPacket(largestAcked)
                         .build();
-    ack.largestAckedPacket = largestAcked;
+    ack.largestNewlyAckedPacket = largestAcked;
     ack.ackedBytes = ackedSize;
     ack.ackedPackets.push_back(makeAckPacketFromOutstandingPacket(createPacket(
         largestAcked,

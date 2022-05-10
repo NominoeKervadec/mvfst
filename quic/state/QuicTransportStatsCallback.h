@@ -73,6 +73,8 @@ class QuicTransportStatsCallback {
 
   virtual void onPacketSent() = 0;
 
+  virtual void onDSRPacketSent(size_t pktSize) = 0;
+
   virtual void onPacketRetransmission() = 0;
 
   virtual void onPacketLoss() = 0;
@@ -92,6 +94,8 @@ class QuicTransportStatsCallback {
   virtual void onClientInitialReceived(QuicVersion version) = 0;
 
   virtual void onConnectionRateLimited() = 0;
+
+  virtual void onConnectionWritableBytesLimited() = 0;
 
   virtual void onNewTokenReceived() = 0;
 

@@ -9,7 +9,8 @@
 
 #include <quic/QuicException.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
-
+#include <quic/congestion_control/CongestionController.h>
+#include <quic/state/AckEvent.h>
 #include <quic/state/StateData.h>
 
 namespace quic {
@@ -102,8 +103,6 @@ class Cubic : public CongestionController {
 
   void getStats(CongestionControllerStats& stats) const override;
 
-  void setExperimental(bool experimental) override;
-
   void handoff(uint64_t newCwnd, uint64_t newInflight) noexcept;
 
   CongestionControlType type() const noexcept override;
@@ -194,10 +193,6 @@ class Cubic : public CongestionController {
   HystartState hystartState_;
   SteadyState steadyState_;
   RecoveryState recoveryState_;
-
-  // Experimental settings for CUBIC
-  std::chrono::microseconds delayIncreaseUpperBound{kDelayIncreaseUpperBound};
-  std::chrono::microseconds delayIncreaseLowerBound{kDelayIncreaseLowerBound};
 };
 
 folly::StringPiece cubicStateToString(CubicStates state);

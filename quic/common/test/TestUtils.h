@@ -11,6 +11,7 @@
 #include <quic/codec/QuicPacketBuilder.h>
 #include <quic/codec/Types.h>
 #include <quic/common/BufUtil.h>
+#include <quic/common/test/TestPacketBuilders.h>
 #include <quic/fizz/client/handshake/QuicPskCache.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
 #include <quic/fizz/server/handshake/FizzServerHandshake.h>
@@ -61,7 +62,8 @@ RegularQuicPacketBuilder::Packet createAckPacket(
     PacketNum pn,
     AckBlocks& acks,
     PacketNumberSpace pnSpace,
-    const Aead* aead = nullptr);
+    const Aead* aead = nullptr,
+    std::chrono::microseconds ackDelay = 0us);
 
 PacketNum rstStreamAndSendPacket(
     QuicServerConnectionState& conn,
@@ -329,9 +331,11 @@ class FizzCryptoTestFactory : public FizzCryptoFactory {
   std::unique_ptr<PacketNumberCipher> makePacketNumberCipher(
       fizz::CipherSuite) const override;
 
-  MOCK_CONST_METHOD1(
+  MOCK_METHOD(
+      std::unique_ptr<PacketNumberCipher>,
       _makePacketNumberCipher,
-      std::unique_ptr<PacketNumberCipher>(folly::ByteRange));
+      (folly::ByteRange),
+      (const));
 
   std::unique_ptr<PacketNumberCipher> makePacketNumberCipher(
       folly::ByteRange secret) const override;
@@ -397,38 +401,52 @@ class FakeServerHandshake : public FizzServerHandshake {
 
   void accept(std::shared_ptr<ServerTransportParametersExtension>) override {}
 
-  MOCK_METHOD1(writeNewSessionTicket, void(const AppToken&));
+  MOCK_METHOD(void, writeNewSessionTicket, (const AppToken&));
+
+  void onClientHello(bool chloWithCert = false) {
+    // Do NOT invoke onCryptoEventAvailable callback
+    // Fall through and let the ServerStateMachine to process the event
+    writeDataToQuicStream(
+        *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
+        folly::IOBuf::copyBuffer("SHLO"));
+    if (chloWithCert) {
+      /* write 4000 bytes of data to the handshake crypto stream */
+      writeDataToQuicStream(
+          *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Handshake),
+          folly::IOBuf::copyBuffer(std::string(4000, '.')));
+    }
+
+    if (allowZeroRttKeys_) {
+      validateAndUpdateSourceToken(conn_, sourceAddrs_);
+      phase_ = Phase::KeysDerived;
+      setEarlyKeys();
+    }
+    setHandshakeKeys();
+  }
+
+  void onClientFin() {
+    // Do NOT invoke onCryptoEventAvailable callback
+    // Fall through and let the ServerStateMachine to process the event
+    setOneRttKeys();
+    phase_ = Phase::Established;
+    handshakeDone_ = true;
+  }
 
   void doHandshake(std::unique_ptr<folly::IOBuf> data, EncryptionLevel)
       override {
     folly::IOBufEqualTo eq;
     auto chlo = folly::IOBuf::copyBuffer("CHLO");
+    auto chloWithCert = folly::IOBuf::copyBuffer("CHLO_CERT");
     auto clientFinished = folly::IOBuf::copyBuffer("FINISHED");
-    if (eq(data, chlo)) {
+    bool sendHandshakeBytes = false;
+
+    if (eq(data, chlo) || (sendHandshakeBytes = eq(data, chloWithCert))) {
       if (chloSync_) {
-        // Do NOT invoke onCryptoEventAvailable callback
-        // Fall through and let the ServerStateMachine to process the event
-        writeDataToQuicStream(
-            *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
-            folly::IOBuf::copyBuffer("SHLO"));
-        if (allowZeroRttKeys_) {
-          validateAndUpdateSourceToken(conn_, sourceAddrs_);
-          phase_ = Phase::KeysDerived;
-          setEarlyKeys();
-        }
-        setHandshakeKeys();
+        onClientHello(sendHandshakeBytes);
       } else {
         // Asynchronously schedule the callback
-        executor_->add([&] {
-          writeDataToQuicStream(
-              *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
-              folly::IOBuf::copyBuffer("SHLO"));
-          if (allowZeroRttKeys_) {
-            validateAndUpdateSourceToken(conn_, sourceAddrs_);
-            phase_ = Phase::KeysDerived;
-            setEarlyKeys();
-          }
-          setHandshakeKeys();
+        executor_->add([sendHandshakeBytes, this] {
+          onClientHello(sendHandshakeBytes);
           if (callback_) {
             callback_->onCryptoEventAvailable();
           }
@@ -436,17 +454,11 @@ class FakeServerHandshake : public FizzServerHandshake {
       }
     } else if (eq(data, clientFinished)) {
       if (cfinSync_) {
-        // Do NOT invoke onCryptoEventAvailable callback
-        // Fall through and let the ServerStateMachine to process the event
-        setOneRttKeys();
-        phase_ = Phase::Established;
-        handshakeDone_ = true;
+        onClientFin();
       } else {
         // Asynchronously schedule the callback
         executor_->add([&] {
-          setOneRttKeys();
-          phase_ = Phase::Established;
-          handshakeDone_ = true;
+          onClientFin();
           if (callback_) {
             callback_->onCryptoEventAvailable();
           }

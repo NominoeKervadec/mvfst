@@ -39,33 +39,59 @@ namespace quic {
 
 void updateRtt(
     QuicConnectionStateBase& conn,
-    std::chrono::microseconds rttSample,
-    std::chrono::microseconds ackDelay) {
-  std::chrono::microseconds minRtt = timeMin(conn.lossState.mrtt, rttSample);
-  conn.lossState.maxAckDelay = timeMax(conn.lossState.maxAckDelay, ackDelay);
-  bool shouldUseAckDelay = (rttSample > ackDelay) &&
-      (rttSample > minRtt + ackDelay || conn.lossState.mrtt == kDefaultMinRtt);
-  if (shouldUseAckDelay) {
-    rttSample -= ackDelay;
-  }
+    const std::chrono::microseconds rttSample,
+    const std::chrono::microseconds ackDelay) {
+  // update mrtt
+  //
   // mrtt ignores ack delay. This is the same in the current recovery draft
   // section A.6.
-  conn.lossState.mrtt = minRtt;
-  // We use the original minRtt without the ack delay included here
-  // explicitly. We might want to change this by including ackDelay
-  // as well.
+  conn.lossState.mrtt = timeMin(conn.lossState.mrtt, rttSample);
+
+  // update mrttNoAckDelay
+  //
+  // keep a version of mrtt formed from rtt samples with ACK delay removed
+  if (rttSample >= ackDelay) {
+    const auto rttSampleNoAckDelay =
+        std::chrono::ceil<std::chrono::microseconds>(rttSample - ackDelay);
+    conn.lossState.maybeMrttNoAckDelay = (conn.lossState.maybeMrttNoAckDelay)
+        ? std::min(*conn.lossState.maybeMrttNoAckDelay, rttSampleNoAckDelay)
+        : rttSampleNoAckDelay;
+  }
+
+  // update lrtt and lrttAckDelay
   conn.lossState.lrtt = rttSample;
+  conn.lossState.maybeLrtt = rttSample;
+  conn.lossState.maybeLrttAckDelay = ackDelay;
+
+  // update maxAckDelay
+  conn.lossState.maxAckDelay = timeMax(conn.lossState.maxAckDelay, ackDelay);
+
+  // determine the adjusted RTT sample we will use for srtt calculations
+  //
+  // do NOT subtract the acknowledgment delay from the RTT sample if the
+  // resulting value is smaller than the min_rtt; this limits underestimation
+  // of the smoothed_rtt due to a misreporting peer.
+  //
+  // if this is the first RTT sample, then it is also the minRTT and ACK delay
+  // will not be subtracted
+  const auto adjustedRtt =
+      ((rttSample > ackDelay) && (rttSample > conn.lossState.mrtt + ackDelay))
+      ? rttSample - ackDelay
+      : rttSample;
   if (conn.lossState.srtt == 0us) {
-    conn.lossState.srtt = rttSample;
-    conn.lossState.rttvar = rttSample / 2;
+    conn.lossState.srtt = adjustedRtt;
+    conn.lossState.rttvar = adjustedRtt / 2;
   } else {
     conn.lossState.rttvar = conn.lossState.rttvar * (kRttBeta - 1) / kRttBeta +
-        (conn.lossState.srtt > rttSample ? conn.lossState.srtt - rttSample
-                                         : rttSample - conn.lossState.srtt) /
+        (conn.lossState.srtt > adjustedRtt
+             ? conn.lossState.srtt - adjustedRtt
+             : adjustedRtt - conn.lossState.srtt) /
             kRttBeta;
     conn.lossState.srtt = conn.lossState.srtt * (kRttAlpha - 1) / kRttAlpha +
-        rttSample / kRttAlpha;
+        adjustedRtt / kRttAlpha;
   }
+
+  // inform qlog
   if (conn.qLogger) {
     conn.qLogger->addMetricUpdate(
         rttSample, conn.lossState.mrtt, conn.lossState.srtt, ackDelay);
@@ -332,6 +358,13 @@ std::pair<folly::Optional<TimePoint>, PacketNumberSpace> earliestTimeAndSpace(
     }
   }
   return res;
+}
+
+uint64_t maximumConnectionIdsToIssue(const QuicConnectionStateBase& conn) {
+  // Return a min of what peer supports and hardcoded max limit.
+  const uint64_t maximumIdsToIssue =
+      std::min(conn.peerActiveConnectionIdLimit, kMaxActiveConnectionIdLimit);
+  return maximumIdsToIssue;
 }
 
 } // namespace quic

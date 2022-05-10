@@ -90,14 +90,18 @@ void recoverOrResetCongestionAndRttState(
   }
 }
 
-void setExperimentalSettings(QuicServerConnectionState& conn) {
-  // MVFST_EXPERIMENTAL currently enables experimental congestion control
-  // and experimental pacer. (here and in the client transport)
-  if (conn.congestionController) {
-    conn.congestionController->setExperimental(true);
-  }
-  if (conn.pacer) {
-    conn.pacer->setExperimental(true);
+void maybeSetExperimentalSettings(QuicServerConnectionState& conn) {
+  if (conn.version == QuicVersion::MVFST_EXPERIMENTAL) {
+    // MVFST_EXPERIMENTAL currently enables experimental congestion control
+    // and experimental pacer. (here and in the client transport)
+    if (conn.congestionController) {
+      conn.congestionController->setExperimental(true);
+    }
+    if (conn.pacer) {
+      conn.pacer->setExperimental(true);
+    }
+  } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL3) {
+    conn.transportSettings.enableWritableBytesLimit = true;
   }
 }
 } // namespace
@@ -386,6 +390,7 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
       conn.qLogger->addTransportStateUpdate(kDerivedOneRttReadCipher);
     }
     // Clear limit because CFIN is received at this point
+    conn.isClientAddrVerified = true;
     conn.writableBytesLimit = folly::none;
     conn.readCodec->setOneRttReadCipher(std::move(oneRttReadCipher));
   }
@@ -439,6 +444,7 @@ bool validateAndUpdateSourceToken(
       // of vector to increase its favorability.
       sourceAddresses.erase(sourceAddresses.begin() + ii);
       sourceAddresses.push_back(conn.peerAddress.getIPAddress());
+      conn.isClientAddrVerified = true;
     }
   }
   conn.sourceTokenMatching = foundMatch;
@@ -477,6 +483,11 @@ void updateWritableByteLimitOnRecvPacket(QuicServerConnectionState& conn) {
   // that a peer can do the same by opening a new connection.
   if (conn.writableBytesLimit) {
     conn.writableBytesLimit = *conn.writableBytesLimit +
+        conn.transportSettings.limitedCwndInMss * conn.udpSendPacketLen;
+  } else if (
+      !conn.isClientAddrVerified &&
+      conn.transportSettings.enableWritableBytesLimit) {
+    conn.writableBytesLimit =
         conn.transportSettings.limitedCwndInMss * conn.udpSendPacketLen;
   }
 }
@@ -895,9 +906,7 @@ void onServerReadDataFromOpen(
             "Invalid packet type", TransportErrorCode::PROTOCOL_VIOLATION);
       }
       conn.version = longHeader->getVersion();
-      if (conn.version == QuicVersion::MVFST_EXPERIMENTAL) {
-        setExperimentalSettings(conn);
-      }
+      maybeSetExperimentalSettings(conn);
     }
 
     if (conn.peerAddress != readData.peer) {

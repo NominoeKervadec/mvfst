@@ -225,7 +225,7 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
 
   void setConnectionSetupCallback(ConnectionSetupCallback* callback) final;
 
-  void setConnectionCallbackNew(ConnectionCallbackNew* callback) final;
+  void setConnectionCallback(ConnectionCallback* callback) final;
 
   void setEarlyDataAppParamsFunctions(
       folly::Function<bool(const folly::Optional<std::string>&, const Buf&)
@@ -539,6 +539,24 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
     QuicTransportBase* transport_;
   };
 
+  class KeepaliveTimeout : public folly::HHWheelTimer::Callback {
+   public:
+    ~KeepaliveTimeout() override = default;
+
+    explicit KeepaliveTimeout(QuicTransportBase* transport)
+        : transport_(transport) {}
+
+    void timeoutExpired() noexcept override {
+      transport_->keepaliveTimeoutExpired();
+    }
+    void callbackCanceled() noexcept override {
+      // Specifically do nothing since if we got canceled we shouldn't write.
+    }
+
+   private:
+    QuicTransportBase* transport_;
+  };
+
   // DrainTimeout is a bit different from other timeouts. It needs to hold a
   // shared_ptr to the transport, since if a DrainTimeout is scheduled,
   // transport cannot die.
@@ -622,34 +640,6 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   }
 
   virtual void cancelAllAppCallbacks(const QuicError& error) noexcept;
-
-  /**
-   * Adds an observer.
-   *
-   * Observers can tie their lifetime to aspects of this socket's lifecycle /
-   * lifetime and perform inspection at various states.
-   *
-   * This enables instrumentation to be added without changing / interfering
-   * with how the application uses the socket.
-   *
-   * @param observer     Observer to add (implements Observer).
-   */
-  void addObserver(Observer* observer) override;
-
-  /**
-   * Removes an observer.
-   *
-   * @param observer     Observer to remove.
-   * @return             Whether observer found and removed from list.
-   */
-  bool removeObserver(Observer* observer) override;
-
-  /**
-   * Returns installed observers.
-   *
-   * @return             Reference to const vector with installed observers.
-   */
-  FOLLY_NODISCARD const ObserverVec& getObservers() const override;
 
   FOLLY_NODISCARD QuicConnectionStats getConnectionsStats() const override;
 
@@ -792,6 +782,7 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   void ackTimeoutExpired() noexcept;
   void pathValidationTimeoutExpired() noexcept;
   void idleTimeoutExpired(bool drain) noexcept;
+  void keepaliveTimeoutExpired() noexcept;
   void drainTimeoutExpired() noexcept;
   void pingTimeoutExpired() noexcept;
   void d6dProbeTimeoutExpired() noexcept;
@@ -815,7 +806,8 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   void notifyStartWritingFromAppRateLimited();
   void notifyPacketsWritten(
       const uint64_t numPacketsWritten,
-      const uint64_t numAckElicitingPacketsWritten);
+      const uint64_t numAckElicitingPacketsWritten,
+      const uint64_t numBytesWritten);
   void notifyAppRateLimited();
 
   /**
@@ -866,7 +858,7 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   std::atomic<folly::EventBase*> evb_;
   std::unique_ptr<folly::AsyncUDPSocket> socket_;
   ConnectionSetupCallback* connSetupCallback_{nullptr};
-  ConnectionCallbackNew* connCallback_{nullptr};
+  ConnectionCallback* connCallback_{nullptr};
   // A flag telling transport if the new onConnectionEnd(error) cb must be used.
   bool useConnectionEndWithErrorCallback_{false};
 
@@ -902,12 +894,14 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   std::map<StreamId, WriteCallback*> pendingWriteCallbacks_;
   CloseState closeState_{CloseState::OPEN};
   bool transportReadyNotified_{false};
+  bool handshakeDoneNotified_{false};
   bool d6dProbingStarted_{false};
 
   LossTimeout lossTimeout_;
   AckTimeout ackTimeout_;
   PathValidationTimeout pathValidationTimeout_;
   IdleTimeout idleTimeout_;
+  KeepaliveTimeout keepaliveTimeout_;
   DrainTimeout drainTimeout_;
   PingTimeout pingTimeout_;
   D6DProbeTimeout d6dProbeTimeout_;
@@ -922,10 +916,6 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   folly::SocketAddress localFallbackAddress;
 
   folly::Optional<std::string> exceptionCloseWhat_;
-
-  // Observers
-
-  std::shared_ptr<ObserverVec> observers_{std::make_shared<ObserverVec>()};
 
   uint64_t qlogRefcnt_{0};
 

@@ -32,7 +32,7 @@ class TestingQuicServerTransport : public QuicServerTransport {
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> sock,
       ConnectionSetupCallback* connSetupCb,
-      ConnectionCallbackNew* connCb,
+      ConnectionCallback* connCb,
       std::shared_ptr<const fizz::server::FizzServerContext> ctx)
       : QuicServerTransport(
             evb,
@@ -59,6 +59,10 @@ class TestingQuicServerTransport : public QuicServerTransport {
 
   auto& idleTimeout() {
     return idleTimeout_;
+  }
+
+  auto& keepaliveTimeout() {
+    return keepaliveTimeout_;
   }
 
   auto& drainTimeout() {
@@ -161,6 +165,7 @@ class QuicServerTransportTestBase : public virtual testing::Test {
         getCanIgnorePathMTU();
     server->getNonConstConn().transportSettings.disableMigration =
         getDisableMigration();
+    server->getNonConstConn().transportSettings.enableKeepalive = true;
     server->setConnectionIdAlgo(connIdAlgo_.get());
     server->setClientConnectionId(*clientConnectionId);
     server->setClientChosenDestConnectionId(*initialDestinationConnectionId);
@@ -176,7 +181,10 @@ class QuicServerTransportTestBase : public virtual testing::Test {
     EXPECT_EQ(
         *server->getConn().clientConnectionId,
         server->getConn().peerConnectionIds[0].connId);
+    SetUpChild();
   }
+
+  virtual void SetUpChild() {}
 
   void destroyTransport() {
     server = nullptr;
@@ -202,7 +210,7 @@ class QuicServerTransportTestBase : public virtual testing::Test {
     return connSetupCallback;
   }
 
-  MockConnectionCallbackNew& getConnCallback() {
+  MockConnectionCallback& getConnCallback() {
     return connCallback;
   }
 
@@ -345,6 +353,14 @@ class QuicServerTransportTestBase : public virtual testing::Test {
   virtual void setupConnection() {
     EXPECT_EQ(server->getConn().readCodec, nullptr);
     EXPECT_EQ(server->getConn().statsCallback, quicStats_.get());
+    // None of these connections should cause the server to get WritableBytes
+    // limited.
+    EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
+    // Not all connections are successful, in which case we don't call
+    // onConnectionClose. The best we can test here is that onConnectionClose
+    // doesn't get invoked more than once
+    EXPECT_CALL(*quicStats_, onConnectionClose(testing::_))
+        .Times(testing::AtMost(1));
     setupClientReadCodec();
     recvClientHello();
 
@@ -385,6 +401,7 @@ class QuicServerTransportTestBase : public virtual testing::Test {
 
     EXPECT_TRUE(server->getConn().pendingEvents.frames.empty());
     EXPECT_EQ(server->getConn().nextSelfConnectionIdSequence, 1);
+    EXPECT_CALL(connSetupCallback, onFullHandshakeDone()).Times(1);
     recvClientFinished();
 
     // We need an extra pump here for some reason.
@@ -409,10 +426,8 @@ class QuicServerTransportTestBase : public virtual testing::Test {
         }
       }
     }
-    uint64_t connIdsToIssue = std::min(
-                                  server->getConn().peerActiveConnectionIdLimit,
-                                  kDefaultActiveConnectionIdLimit) -
-        1;
+    uint64_t connIdsToIssue =
+        maximumConnectionIdsToIssue(server->getConn()) - 1;
 
     if (server->getConn().transportSettings.disableMigration ||
         (connIdsToIssue == 0)) {
@@ -559,7 +574,7 @@ class QuicServerTransportTestBase : public virtual testing::Test {
   folly::SocketAddress serverAddr;
   folly::SocketAddress clientAddr;
   testing::NiceMock<MockConnectionSetupCallback> connSetupCallback;
-  testing::NiceMock<MockConnectionCallbackNew> connCallback;
+  testing::NiceMock<MockConnectionCallback> connCallback;
   testing::NiceMock<MockRoutingCallback> routingCallback;
   testing::NiceMock<MockHandshakeFinishedCallback> handshakeFinishedCallback;
   folly::Optional<ConnectionId> clientConnectionId;

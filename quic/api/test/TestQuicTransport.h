@@ -22,15 +22,17 @@ class TestQuicTransport
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> socket,
       ConnectionSetupCallback* connSetupCb,
-      ConnectionCallbackNew* connCb)
-      : QuicTransportBase(evb, std::move(socket)) {
+      ConnectionCallback* connCb)
+      : QuicTransportBase(evb, std::move(socket)),
+        observerContainer_(std::make_shared<SocketObserverContainer>(this)) {
     setConnectionSetupCallback(connSetupCb);
-    setConnectionCallbackNew(connCb);
+    setConnectionCallback(connCb);
     conn_.reset(new QuicServerConnectionState(
         FizzServerQuicHandshakeContext::Builder().build()));
     conn_->clientConnectionId = ConnectionId({9, 8, 7, 6});
     conn_->serverConnectionId = ConnectionId({1, 2, 3, 4});
     conn_->version = QuicVersion::MVFST;
+    conn_->observerContainer = observerContainer_;
     aead = test::createNoOpAead();
     headerCipher = test::createNoOpHeaderCipher();
   }
@@ -117,6 +119,10 @@ class TestQuicTransport
     return idleTimeout_;
   }
 
+  auto& keepalivetimeout() {
+    return keepaliveTimeout_;
+  }
+
   CloseState closeState() {
     return closeState_;
   }
@@ -139,8 +145,10 @@ class TestQuicTransport
 
   void invokeNotifyPacketsWritten(
       const uint64_t numPacketsWritten,
-      const uint64_t numAckElicitingPacketsWritten) {
-    notifyPacketsWritten(numPacketsWritten, numAckElicitingPacketsWritten);
+      const uint64_t numAckElicitingPacketsWritten,
+      const uint64_t numBytesWritten) {
+    notifyPacketsWritten(
+        numPacketsWritten, numAckElicitingPacketsWritten, numBytesWritten);
   }
 
   void invokeNotifyAppRateLimited() {
@@ -151,9 +159,21 @@ class TestQuicTransport
     transportReadyNotified_ = transportReadyNotified;
   }
 
+  SocketObserverContainer* getSocketObserverContainer() const override {
+    return observerContainer_.get();
+  }
+
   std::unique_ptr<Aead> aead;
   std::unique_ptr<PacketNumberCipher> headerCipher;
   bool closed{false};
+
+  // Container of observers for the socket / transport.
+  //
+  // This member MUST be last in the list of members to ensure it is destroyed
+  // first, before any other members are destroyed. This ensures that observers
+  // can inspect any socket / transport state available through public methods
+  // when destruction of the transport begins.
+  const std::shared_ptr<SocketObserverContainer> observerContainer_;
 };
 
 } // namespace quic

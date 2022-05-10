@@ -19,7 +19,15 @@
 
 #include <folly/io/async/AsyncTransportCertificate.h>
 
+#include <fizz/record/Types.h>
+
 namespace quic {
+
+struct CipherInfo {
+  TrafficKey trafficKey;
+  fizz::CipherSuite cipherSuite;
+  Buf packetProtectionKey;
+};
 
 class QuicServerTransport
     : public QuicTransportBase,
@@ -62,7 +70,7 @@ class QuicServerTransport
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> sock,
       ConnectionSetupCallback* connSetupCb,
-      ConnectionCallbackNew* connStreamsCb,
+      ConnectionCallback* connStreamsCb,
       std::shared_ptr<const fizz::server::FizzServerContext> ctx,
       bool useConnectionEndWithErrorCallback = false);
 
@@ -70,7 +78,7 @@ class QuicServerTransport
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> sock,
       ConnectionSetupCallback* connSetupCb,
-      ConnectionCallbackNew* connStreamsCb,
+      ConnectionCallback* connStreamsCb,
       std::shared_ptr<const fizz::server::FizzServerContext> ctx,
       std::unique_ptr<CryptoFactory> cryptoFactory = nullptr,
       bool useConnectionEndWithErrorCallback = false);
@@ -80,7 +88,7 @@ class QuicServerTransport
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> sock,
       ConnectionSetupCallback* connSetupCb,
-      ConnectionCallbackNew* connStreamsCb,
+      ConnectionCallback* connStreamsCb,
       std::shared_ptr<const fizz::server::FizzServerContext> ctx,
       std::unique_ptr<CryptoFactory> cryptoFactory,
       PacketNum startingPacketNum);
@@ -117,6 +125,8 @@ class QuicServerTransport
 
   void setClientChosenDestConnectionId(const ConnectionId& serverCid);
 
+  void verifiedClientAddress();
+
   // From QuicTransportBase
   void onReadData(
       const folly::SocketAddress& peer,
@@ -148,7 +158,14 @@ class QuicServerTransport
   const std::shared_ptr<const folly::AsyncTransportCertificate>
   getPeerCertificate() const override;
 
+  virtual CipherInfo getOneRttCipherInfo() const;
+
  protected:
+  // From QuicSocket
+  SocketObserverContainer* getSocketObserverContainer() const override {
+    return observerContainer_.get();
+  }
+
   // From ServerHandshake::HandshakeCallback
   virtual void onCryptoEventAvailable() noexcept override;
 
@@ -185,5 +202,13 @@ class QuicServerTransport
       uint64_t,
       std::function<void(QuicServerTransport*, uint64_t)>>
       transportKnobParamHandlers_;
+
+  // Container of observers for the socket / transport.
+  //
+  // This member MUST be last in the list of members to ensure it is destroyed
+  // first, before any other members are destroyed. This ensures that observers
+  // can inspect any socket / transport state available through public methods
+  // when destruction of the transport begins.
+  const std::shared_ptr<SocketObserverContainer> observerContainer_;
 };
 } // namespace quic

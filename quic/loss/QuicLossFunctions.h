@@ -11,12 +11,13 @@
 #include <folly/Optional.h>
 #include <folly/io/async/AsyncTimeout.h>
 #include <quic/QuicConstants.h>
-#include <quic/api/Observer.h>
 #include <quic/codec/Types.h>
 #include <quic/common/TimeUtil.h>
+#include <quic/congestion_control/CongestionController.h>
 #include <quic/d6d/QuicD6DStateFunctions.h>
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/logging/QLoggerConstants.h>
+#include <quic/observer/SocketObserverTypes.h>
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/SimpleFrameFunctions.h>
 #include <quic/state/StateData.h>
@@ -212,8 +213,10 @@ folly::Optional<CongestionController::LossEvent> detectLossPackets(
            << " delayUntilLost=" << delayUntilLost.count() << "us"
            << " " << conn;
   CongestionController::LossEvent lossEvent(lossTime);
-  folly::Optional<Observer::LossEvent> observerLossEvent;
-  if (!conn.observers->empty()) {
+  folly::Optional<SocketObserverInterface::LossEvent> observerLossEvent;
+  if (conn.observerContainer &&
+      conn.observerContainer->hasObserversForEvent<
+          SocketObserverInterface::Events::lossEvents>()) {
     observerLossEvent.emplace(lossTime);
   }
   // Note that time based loss detection is also within the same PNSpace.
@@ -312,16 +315,16 @@ folly::Optional<CongestionController::LossEvent> detectLossPackets(
     iter++;
   } // while (iter != conn.outstandings.packets.end()) {
 
-  // if there are observers, enqueue a function to call it
-  if (observerLossEvent && observerLossEvent->hasPackets()) {
-    for (const auto& observer : *(conn.observers)) {
-      conn.pendingCallbacks.emplace_back(
-          [observer, observerLossEvent](QuicSocket* qSocket) {
-            if (observer->getConfig().lossEvents) {
-              observer->packetLossDetected(qSocket, *observerLossEvent);
-            }
-          });
-    }
+  // notify observers
+  if (observerLossEvent && observerLossEvent->hasPackets() &&
+      conn.observerContainer &&
+      conn.observerContainer->hasObserversForEvent<
+          SocketObserverInterface::Events::lossEvents>()) {
+    conn.observerContainer
+        ->invokeInterfaceMethod<SocketObserverInterface::Events::lossEvents>(
+            [observerLossEvent](auto observer, auto observed) {
+              observer->packetLossDetected(observed, *observerLossEvent);
+            });
   }
 
   auto earliest = getFirstOutstandingPacket(conn, pnSpace);
@@ -419,11 +422,11 @@ folly::Optional<CongestionController::LossEvent> handleAckForLoss(
     CongestionController::AckEvent& ack,
     PacketNumberSpace pnSpace) {
   auto& largestAcked = getAckState(conn, pnSpace).largestAckedByPeer;
-  if (ack.largestAckedPacket.hasValue()) {
+  if (ack.largestNewlyAckedPacket.has_value()) {
     conn.lossState.ptoCount = 0;
     largestAcked = std::max<PacketNum>(
-        largestAcked.value_or(*ack.largestAckedPacket),
-        *ack.largestAckedPacket);
+        largestAcked.value_or(*ack.largestNewlyAckedPacket),
+        *ack.largestNewlyAckedPacket);
   }
   auto lossEvent = detectLossPackets(
       conn,
@@ -433,8 +436,8 @@ folly::Optional<CongestionController::LossEvent> handleAckForLoss(
       pnSpace);
   conn.pendingEvents.setLossDetectionAlarm =
       conn.outstandings.numOutstanding() > 0;
-  VLOG(10) << __func__
-           << " largestAckedInPacket=" << ack.largestAckedPacket.value_or(0)
+  VLOG(10) << __func__ << " largestAckedInPacket="
+           << ack.largestNewlyAckedPacket.value_or(0)
            << " setLossDetectionAlarm="
            << conn.pendingEvents.setLossDetectionAlarm
            << " outstanding=" << conn.outstandings.numOutstanding()

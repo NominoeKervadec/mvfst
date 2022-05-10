@@ -12,9 +12,10 @@
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/AsyncTransportCertificate.h>
 #include <quic/QuicConstants.h>
-#include <quic/api/Observer.h>
 #include <quic/codec/Types.h>
 #include <quic/common/SmallVec.h>
+#include <quic/observer/SocketObserverContainer.h>
+#include <quic/observer/SocketObserverTypes.h>
 #include <quic/state/QuicConnectionStats.h>
 #include <quic/state/QuicPriorityQueue.h>
 #include <quic/state/QuicStreamUtilities.h>
@@ -63,15 +64,22 @@ class QuicSocket {
      * onTransportReady(), signifies full crypto handshake finished.
      */
     virtual void onReplaySafe() noexcept {}
+
+    /**
+     * Essentially Server only as clients have onReplaySafe.
+     * Called after onTransportReady() and in case of 0-RTT, unlike
+     * onTransportReady(), signifies full crypto handshake finished.
+     */
+    virtual void onFullHandshakeDone() noexcept {}
   };
 
   /**
    * Callback for connection level events once connection is set up.
    * The name is temporary until we phase out the old monolithic callback.
    */
-  class ConnectionCallbackNew {
+  class ConnectionCallback {
    public:
-    virtual ~ConnectionCallbackNew() = default;
+    virtual ~ConnectionCallback() = default;
 
     /**
      * Invoked when stream id's flow control state changes.  This is an edge
@@ -151,7 +159,10 @@ class QuicSocket {
     std::chrono::microseconds srtt{0us};
     std::chrono::microseconds rttvar{0us};
     std::chrono::microseconds lrtt{0us};
+    folly::Optional<std::chrono::microseconds> maybeLrtt;
+    folly::Optional<std::chrono::microseconds> maybeLrttAckDelay;
     folly::Optional<std::chrono::microseconds> maybeMinRtt;
+    folly::Optional<std::chrono::microseconds> maybeMinRttNoAckDelay;
     uint64_t mss{kDefaultUDPSendPacketLen};
     CongestionControlType congestionControlType{CongestionControlType::None};
     uint64_t writableBytes{0};
@@ -223,7 +234,7 @@ class QuicSocket {
    * Sets connection streams callback. This callback must be set after
    * connection set up is finished and is ready for streams processing.
    */
-  virtual void setConnectionCallbackNew(ConnectionCallbackNew* callback) = 0;
+  virtual void setConnectionCallback(ConnectionCallback* callback) = 0;
 
   /**
    * Sets the functions that mvfst will invoke to validate early data params
@@ -908,7 +919,7 @@ class QuicSocket {
    */
   class DeliveryCallback : public ByteEventCallback {
    public:
-    virtual ~DeliveryCallback() = default;
+    ~DeliveryCallback() override = default;
 
     /**
      * Invoked when the peer has acknowledged the receipt of the specified
@@ -1170,33 +1181,74 @@ class QuicSocket {
    */
   virtual void setCongestionControl(CongestionControlType type) = 0;
 
+  using Observer = SocketObserverContainer::Observer;
+  using ManagedObserver = SocketObserverContainer::ManagedObserver;
+
   /**
    * Adds an observer.
    *
-   * Observers can tie their lifetime to aspects of this socket's  /
-   * lifetime and perform inspection at various states.
+   * If the observer is already added, this is a no-op.
    *
-   * This enables instrumentation to be added without changing / interfering
-   * with how the application uses the socket.
-   *
-   * @param observer     Observer to add (implements Observer).
+   * @param observer     Observer to add.
+   * @return             Whether the observer was added (fails if no list).
    */
-  virtual void addObserver(Observer* observer) = 0;
+  bool addObserver(Observer* observer) {
+    if (auto list = getSocketObserverContainer()) {
+      list->addObserver(observer);
+      return true;
+    }
+    return false;
+  }
 
   /**
    * Removes an observer.
    *
    * @param observer     Observer to remove.
-   * @return             Whether observer found and removed from list.
+   * @return             Whether the observer was found and removed.
    */
-  virtual bool removeObserver(Observer* observer) = 0;
+  bool removeObserver(Observer* observer) {
+    if (auto list = getSocketObserverContainer()) {
+      return list->removeObserver(observer);
+    }
+    return false;
+  }
 
   /**
-   * Returns installed observers.
+   * Get number of observers.
    *
-   * @return             Reference to const vector with installed observers.
+   * @return             Number of observers.
    */
-  FOLLY_NODISCARD virtual const ObserverVec& getObservers() const = 0;
+  [[nodiscard]] size_t numObservers() const {
+    if (auto list = getSocketObserverContainer()) {
+      return list->numObservers();
+    }
+    return 0;
+  }
+
+  /**
+   * Returns list of attached observers.
+   *
+   * @return             List of observers.
+   */
+  std::vector<Observer*> getObservers() {
+    if (auto list = getSocketObserverContainer()) {
+      return list->getObservers();
+    }
+    return {};
+  }
+
+  /**
+   * Returns list of attached observers that are of type T.
+   *
+   * @return             Attached observers of type T.
+   */
+  template <typename T = Observer>
+  std::vector<T*> findObservers() {
+    if (auto list = getSocketObserverContainer()) {
+      return list->findObservers<T>();
+    }
+    return {};
+  }
 
   /**
    * Returns varios stats of the connection.
@@ -1252,5 +1304,24 @@ class QuicSocket {
    */
   virtual folly::Expected<std::vector<Buf>, LocalErrorCode> readDatagramBufs(
       size_t atMost = 0) = 0;
+
+ protected:
+  /**
+   * Returns the SocketObserverList or nullptr if not available.
+   *
+   * QuicSocket implementations that support observers should override this
+   * function and return the socket observer list that they hold in memory.
+   *
+   * We have a default implementation to ensure that there is no risk of a
+   * pure-virtual function being called during constructon or destruction of
+   * the socket. If this was to occur the derived class which implements this
+   * function may be unavailable leading to undefined behavior. While this is
+   * true for any pure-virtual function, the potential for this issue is
+   * greater for observers.
+   */
+  [[nodiscard]] virtual SocketObserverContainer* getSocketObserverContainer()
+      const {
+    return nullptr;
+  }
 };
 } // namespace quic

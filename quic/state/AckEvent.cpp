@@ -122,9 +122,21 @@ AckEvent::Builder&& AckEvent::Builder::setAdjustedAckTime(
   return std::move(*this);
 }
 
+AckEvent::Builder&& AckEvent::Builder::setAckDelay(
+    std::chrono::microseconds ackDelayIn) {
+  maybeAckDelay = ackDelayIn;
+  return std::move(*this);
+}
+
 AckEvent::Builder&& AckEvent::Builder::setPacketNumberSpace(
     PacketNumberSpace packetNumberSpaceIn) {
   maybePacketNumberSpace = packetNumberSpaceIn;
+  return std::move(*this);
+}
+
+AckEvent::Builder&& AckEvent::Builder::setLargestAckedPacket(
+    PacketNum largestAckedPacketIn) {
+  maybeLargestAckedPacket = largestAckedPacketIn;
   return std::move(*this);
 }
 
@@ -141,8 +153,11 @@ AckEvent::AckEvent(AckEvent::BuilderFields&& builderFields)
     : ackTime(*CHECK_NOTNULL(builderFields.maybeAckTime.get_pointer())),
       adjustedAckTime(
           *CHECK_NOTNULL(builderFields.maybeAdjustedAckTime.get_pointer())),
+      ackDelay(*CHECK_NOTNULL(builderFields.maybeAckDelay.get_pointer())),
       packetNumberSpace(
           *CHECK_NOTNULL(builderFields.maybePacketNumberSpace.get_pointer())),
+      largestAckedPacket(
+          *CHECK_NOTNULL(builderFields.maybeLargestAckedPacket.get_pointer())),
       implicit(builderFields.isImplicitAck) {}
 
 } // namespace quic

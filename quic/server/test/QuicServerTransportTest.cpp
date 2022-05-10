@@ -185,6 +185,7 @@ TEST_F(QuicServerTransportTest, IdleTimerResetOnRecvNewData) {
   ASSERT_FALSE(server->idleTimeout().isScheduled());
   recvEncryptedStream(streamId, *expected);
   ASSERT_TRUE(server->idleTimeout().isScheduled());
+  ASSERT_TRUE(server->keepaliveTimeout().isScheduled());
   EXPECT_CALL(*quicStats_, onQuicStreamClosed());
 }
 
@@ -195,24 +196,28 @@ TEST_F(QuicServerTransportTest, IdleTimerNotResetOnDuplicatePacket) {
   auto expected = IOBuf::copyBuffer("hello");
   auto packet = recvEncryptedStream(streamId, *expected);
   ASSERT_TRUE(server->idleTimeout().isScheduled());
+  ASSERT_TRUE(server->keepaliveTimeout().isScheduled());
 
   server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
   ASSERT_FALSE(server->idleTimeout().isScheduled());
+  ASSERT_FALSE(server->keepaliveTimeout().isScheduled());
   // Try delivering the same packet again
   deliverData(packet->clone(), false);
   ASSERT_FALSE(server->idleTimeout().isScheduled());
+  ASSERT_FALSE(server->keepaliveTimeout().isScheduled());
   EXPECT_CALL(*quicStats_, onQuicStreamClosed());
 }
 
 TEST_F(QuicServerTransportTest, IdleTimerNotResetWhenDataOutstanding) {
   // Clear the receivedNewPacketBeforeWrite flag, since we may reveice from
   // client during the SetUp of the test case.
-  server->getNonConstConn().outstandings.packets.clear();
+  server->getNonConstConn().outstandings.reset();
   server->getNonConstConn().receivedNewPacketBeforeWrite = false;
-  server->getNonConstConn().outstandings.packets.clear();
   StreamId streamId = server->createBidirectionalStream().value();
 
   server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
   ASSERT_FALSE(server->idleTimeout().isScheduled());
   server->writeChain(
       streamId,
@@ -221,9 +226,11 @@ TEST_F(QuicServerTransportTest, IdleTimerNotResetWhenDataOutstanding) {
   loopForWrites();
   // It was the first packet
   EXPECT_TRUE(server->idleTimeout().isScheduled());
+  EXPECT_TRUE(server->keepaliveTimeout().isScheduled());
 
   // cancel it and write something else. This time idle timer shouldn't set.
   server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
   EXPECT_FALSE(server->idleTimeout().isScheduled());
   server->writeChain(
       streamId,
@@ -231,6 +238,7 @@ TEST_F(QuicServerTransportTest, IdleTimerNotResetWhenDataOutstanding) {
       false);
   loopForWrites();
   EXPECT_FALSE(server->idleTimeout().isScheduled());
+  EXPECT_FALSE(server->keepaliveTimeout().isScheduled());
 }
 
 TEST_F(QuicServerTransportTest, TimeoutsNotSetAfterClose) {
@@ -249,10 +257,12 @@ TEST_F(QuicServerTransportTest, TimeoutsNotSetAfterClose) {
       QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
       std::string("how about no")));
   server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
   ASSERT_FALSE(server->idleTimeout().isScheduled());
 
   deliverDataWithoutErrorCheck(packet->clone());
   ASSERT_FALSE(server->idleTimeout().isScheduled());
+  ASSERT_FALSE(server->keepaliveTimeout().isScheduled());
   ASSERT_FALSE(server->lossTimeout().isScheduled());
   ASSERT_FALSE(server->ackTimeout().isScheduled());
   ASSERT_TRUE(server->drainTimeout().isScheduled());
@@ -274,10 +284,12 @@ TEST_F(QuicServerTransportTest, InvalidMigrationNoDrain) {
       QuicErrorCode(TransportErrorCode::INVALID_MIGRATION),
       std::string("migration disabled")));
   server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
   ASSERT_FALSE(server->idleTimeout().isScheduled());
 
   deliverDataWithoutErrorCheck(packet->clone());
   ASSERT_FALSE(server->idleTimeout().isScheduled());
+  ASSERT_FALSE(server->keepaliveTimeout().isScheduled());
   ASSERT_FALSE(server->lossTimeout().isScheduled());
   ASSERT_FALSE(server->ackTimeout().isScheduled());
   ASSERT_FALSE(server->drainTimeout().isScheduled());
@@ -296,10 +308,29 @@ TEST_F(QuicServerTransportTest, IdleTimeoutExpired) {
       serverWrites, *serverReadCodec, QuicFrame::Type::ConnectionCloseFrame));
 }
 
+TEST_F(QuicServerTransportTest, KeepaliveTimeoutExpired) {
+  server->keepaliveTimeout().timeoutExpired();
+
+  EXPECT_FALSE(server->isDraining());
+  EXPECT_FALSE(server->isClosed());
+  server->idleTimeout().cancelTimeout();
+  server->keepaliveTimeout().cancelTimeout();
+  server->getNonConstConn().receivedNewPacketBeforeWrite = true;
+  // After we write, the idletimout and keepalive timeout should be
+  // scheduled and there should be a ping written.
+  loopForWrites();
+  EXPECT_TRUE(server->idleTimeout().isScheduled());
+  EXPECT_TRUE(server->keepaliveTimeout().isScheduled());
+  auto serverReadCodec = makeClientEncryptedCodec();
+  EXPECT_TRUE(verifyFramePresent(
+      serverWrites, *serverReadCodec, QuicFrame::Type::PingFrame));
+}
+
 TEST_F(QuicServerTransportTest, RecvDataAfterIdleTimeout) {
   server->idleTimeout().timeoutExpired();
 
   EXPECT_FALSE(server->idleTimeout().isScheduled());
+  EXPECT_FALSE(server->keepaliveTimeout().isScheduled());
   EXPECT_TRUE(server->isDraining());
   EXPECT_TRUE(server->isClosed());
 
@@ -567,8 +598,7 @@ TEST_F(QuicServerTransportTest, TestOpenAckStreamFrame) {
   auto data = IOBuf::copyBuffer("Aloha");
 
   // Remove any packets that might have been queued.
-  server->getNonConstConn().outstandings.packets.clear();
-  server->getNonConstConn().outstandings.packetCount = {};
+  server->getNonConstConn().outstandings.reset();
   server->writeChain(streamId, data->clone(), false);
   loopForWrites();
   server->writeChain(streamId, data->clone(), false);
@@ -1162,8 +1192,7 @@ TEST_F(QuicServerTransportTest, TestCloneStopSending) {
   server->getNonConstConn().qLogger = qLogger;
   server->getNonConstConn().streamManager->getStream(streamId);
   // knock every handshake outstanding packets out
-  server->getNonConstConn().outstandings.packetCount = {};
-  server->getNonConstConn().outstandings.packets.clear();
+  server->getNonConstConn().outstandings.reset();
   for (auto& t : server->getNonConstConn().lossState.lossTimes) {
     t.reset();
   }
@@ -1702,7 +1731,7 @@ class QuicServerTransportAllowMigrationTest
   }
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicServerTransportMigrationTests,
     QuicServerTransportAllowMigrationTest,
     Values(
@@ -3229,6 +3258,212 @@ TEST_F(QuicUnencryptedServerTransportTest, TestNoAckOnlyCryptoInitial) {
   }
 }
 
+TEST_F(
+    QuicUnencryptedServerTransportTest,
+    TestHandshakeNotWritableBytesLimited) {
+  /**
+   * Set the WritableBytes limit to 5x (~ 5 * 1200 = 6,000). This will be enough
+   * for the handshake to fit (1200 initial + 3000 handshake = 4,200 < 6,000).
+   */
+  auto transportSettings = server->getTransportSettings();
+  transportSettings.limitedCwndInMss = 5;
+  transportSettings.enableWritableBytesLimit = true;
+  server->setTransportSettings(transportSettings);
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
+
+  recvClientHello(true, QuicVersion::MVFST, "CHLO_CERT");
+
+  EXPECT_GE(serverWrites.size(), 3);
+
+  AckStates ackStates;
+
+  auto clientCodec = makeClientEncryptedCodec(true);
+  bool hasCryptoInitialFrame = false;
+  bool hasCryptoHandshakeFrame = false;
+  bool hasAckFrame = false;
+
+  /**
+   * Verify that we've written some cypto frames (initial, handshake packet
+   * spaces) and some acks.
+   */
+  for (auto& write : serverWrites) {
+    auto packetQueue = bufToQueue(write->clone());
+    auto result = clientCodec->parsePacket(packetQueue, ackStates);
+    auto& regularPacket = *result.regularPacket();
+    // EXPECT_TRUE(regularPacket);
+    ProtectionType protectionType = regularPacket.header.getProtectionType();
+    EXPECT_GE(regularPacket.frames.size(), 1);
+    bool hasCryptoFrame = false;
+    for (auto& frame : regularPacket.frames) {
+      hasCryptoFrame |= frame.asReadCryptoFrame() != nullptr;
+      hasAckFrame |= frame.asReadAckFrame() != nullptr;
+    }
+
+    hasCryptoInitialFrame |=
+        (protectionType == ProtectionType::Initial && hasCryptoFrame);
+    hasCryptoHandshakeFrame |=
+        (protectionType == ProtectionType::Handshake && hasCryptoFrame);
+  }
+
+  EXPECT_TRUE(hasCryptoInitialFrame);
+  EXPECT_TRUE(hasCryptoHandshakeFrame);
+  // skipping ack-only initial should not kick in here since we also have crypto
+  // data to write.
+  EXPECT_TRUE(hasAckFrame);
+}
+
+TEST_F(
+    QuicUnencryptedServerTransportTest,
+    TestHandshakeWritableBytesLimitedWithCFin) {
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited())
+      .Times(AtLeast(1));
+  /**
+   * Set the WritableBytes limit to 3x (~ 3 * 1200 = 3,600). This will not be
+   * enough for the handshake to fit (1200 initial + 4000 handshake = 5,200 >
+   * 3,600). We expect to be WritableBytes limited. After receiving an ack/cfin
+   * from the client, the limit should increase and we're now unblocked.
+   */
+  auto transportSettings = server->getTransportSettings();
+  transportSettings.limitedCwndInMss = 3;
+  transportSettings.enableWritableBytesLimit = true;
+  server->setTransportSettings(transportSettings);
+
+  recvClientHello(true, QuicVersion::MVFST, "CHLO_CERT");
+
+  // basically the maximum we can write is three packets before we hit the limit
+  EXPECT_EQ(serverWrites.size(), 3);
+
+  AckStates ackStates;
+
+  auto clientCodec = makeClientEncryptedCodec(true);
+  bool hasCryptoInitialFrame, hasCryptoHandshakeFrame, hasAckFrame;
+  hasCryptoInitialFrame = hasCryptoHandshakeFrame = hasAckFrame = false;
+
+  for (auto& write : serverWrites) {
+    auto packetQueue = bufToQueue(write->clone());
+    auto result = clientCodec->parsePacket(packetQueue, ackStates);
+    auto& regularPacket = *result.regularPacket();
+    // EXPECT_TRUE(regularPacket);
+    ProtectionType protectionType = regularPacket.header.getProtectionType();
+    EXPECT_GE(regularPacket.frames.size(), 1);
+    bool hasCryptoFrame = false;
+    for (auto& frame : regularPacket.frames) {
+      hasCryptoFrame |= frame.asReadCryptoFrame() != nullptr;
+      hasAckFrame |= frame.asReadAckFrame() != nullptr;
+    }
+
+    hasCryptoInitialFrame |=
+        (protectionType == ProtectionType::Initial && hasCryptoFrame);
+    hasCryptoHandshakeFrame |=
+        (protectionType == ProtectionType::Handshake && hasCryptoFrame);
+  }
+
+  EXPECT_TRUE(hasCryptoInitialFrame);
+  EXPECT_TRUE(hasCryptoHandshakeFrame);
+  EXPECT_TRUE(hasAckFrame);
+  /**
+   * Let's now send an ack/cfin to the server which will unblock and let us
+   * finish the handshake. The packets written by the server at this point are
+   * expected to have crypto data and acks only in the handshake pn space, not
+   * initial.
+   */
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
+  serverWrites.clear();
+  recvClientFinished();
+  EXPECT_TRUE(server->getConn().isClientAddrVerified);
+  EXPECT_FALSE(server->getConn().writableBytesLimit);
+  EXPECT_GT(serverWrites.size(), 0);
+
+  hasCryptoInitialFrame = hasCryptoHandshakeFrame = hasAckFrame = false;
+
+  for (auto& write : serverWrites) {
+    auto packetQueue = bufToQueue(write->clone());
+    auto result = clientCodec->parsePacket(packetQueue, ackStates);
+    auto& regularPacket = *result.regularPacket();
+    ProtectionType protectionType = regularPacket.header.getProtectionType();
+    EXPECT_GE(regularPacket.frames.size(), 1);
+    bool hasCryptoFrame = false;
+    for (auto& frame : regularPacket.frames) {
+      hasCryptoFrame |= frame.asReadCryptoFrame() != nullptr;
+      hasAckFrame |= frame.asReadAckFrame() != nullptr;
+    }
+
+    hasCryptoHandshakeFrame |=
+        (protectionType == ProtectionType::Handshake && hasCryptoFrame);
+  }
+
+  // We don't expect crypto frame in initial pnspace since we're done
+  EXPECT_FALSE(hasCryptoInitialFrame);
+  EXPECT_TRUE(hasCryptoHandshakeFrame);
+  EXPECT_TRUE(hasAckFrame);
+}
+
+TEST_F(
+    QuicUnencryptedServerTransportTest,
+    TestHandshakeWritableBytesLimitedPartialAck) {
+  /**
+   * Set the WritableBytes limit to 3x (~ 3 * 1200 = 3,600). This will not be
+   * enough for the handshake to fit (1200 initial + 4000 handshake = 5,200 >
+   * 3,600). We expect to be WritableBytes limited. After receiving an ack
+   * from the client acking only the initial crypto data, the pto should fire
+   * immediately to resend the handshake crypto data.
+   */
+  auto transportSettings = server->getTransportSettings();
+  transportSettings.limitedCwndInMss = 3;
+  transportSettings.enableWritableBytesLimit = true;
+  server->setTransportSettings(transportSettings);
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited())
+      .Times(AtLeast(1));
+
+  recvClientHello(true, QuicVersion::MVFST, "CHLO_CERT");
+
+  // basically the maximum we can write is three packets before we hit the limit
+  EXPECT_EQ(serverWrites.size(), 3);
+
+  AckStates ackStates;
+
+  auto clientCodec = makeClientEncryptedCodec(true);
+
+  for (auto& write : serverWrites) {
+    auto packetQueue = bufToQueue(write->clone());
+    auto result = clientCodec->parsePacket(packetQueue, ackStates);
+    EXPECT_TRUE(result.regularPacket());
+  }
+
+  /**
+   * Let's now send an partial ack to the server, acking only the initial pn
+   * space, which will unblock and let us finish the handshake. Since we've
+   * already sent the handshake data, we expect a pto to fire immediately and
+   */
+
+  serverWrites.clear();
+  auto nextPacketNum = clientNextInitialPacketNum++;
+  auto aead = getInitialCipher();
+  auto headerCipher = getInitialHeaderCipher();
+  AckBlocks acks;
+  auto start = getFirstOutstandingPacket(
+                   server->getNonConstConn(), PacketNumberSpace::Initial)
+                   ->packet.header.getPacketSequenceNum();
+  auto end = getLastOutstandingPacket(
+                 server->getNonConstConn(), PacketNumberSpace::Initial)
+                 ->packet.header.getPacketSequenceNum();
+  acks.insert(start, end);
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
+  deliverData(packetToBufCleartext(
+      createAckPacket(
+          server->getNonConstConn(),
+          nextPacketNum,
+          acks,
+          PacketNumberSpace::Initial,
+          aead.get()),
+      *aead,
+      *headerCipher,
+      nextPacketNum));
+
+  // The server is unblocked and should now be able to finish the handshake
+  EXPECT_GE(serverWrites.size(), 1);
+}
+
 TEST_F(QuicUnencryptedServerTransportTest, TestCorruptedDstCidInitialTest) {
   auto chlo = folly::IOBuf::copyBuffer("CHLO");
   auto nextPacketNum = clientNextInitialPacketNum++;
@@ -3355,6 +3590,7 @@ TEST_F(
 }
 
 TEST_F(QuicUnencryptedServerTransportTest, TestSendHandshakeDone) {
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
   EXPECT_CALL(handshakeFinishedCallback, onHandshakeFinished());
   getFakeHandshakeLayer()->allowZeroRttKeys();
   setupClientReadCodec();
@@ -3398,6 +3634,7 @@ std::pair<int, std::vector<const NewTokenFrame*>> getNewTokenFrame(
 }
 
 TEST_F(QuicUnencryptedServerTransportTest, TestSendHandshakeDoneNewTokenFrame) {
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited()).Times(0);
   std::array<uint8_t, kRetryTokenSecretLength> secret;
   folly::Random::secureRandom(secret.data(), secret.size());
   server->getNonConstConn().transportSettings.retryTokenSecret = secret;
@@ -3445,8 +3682,7 @@ TEST_F(QuicUnencryptedServerTransportTest, TestSendHandshakeDoneNewTokenFrame) {
    */
 
   // Remove any packets that might have been queued.
-  server->getNonConstConn().outstandings.packets.clear();
-  server->getNonConstConn().outstandings.packetCount = {};
+  server->getNonConstConn().outstandings.reset();
 
   StreamId streamId = server->createBidirectionalStream().value();
   auto data = IOBuf::copyBuffer("data");
@@ -3651,7 +3887,7 @@ class QuicServerTransportPendingDataTest
   }
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicServerTransportPendingDataTests,
     QuicServerTransportPendingDataTest,
     Values(
@@ -3890,8 +4126,11 @@ class QuicServerTransportHandshakeTest
     // is processed
     if (GetParam().acceptZeroRtt) {
       EXPECT_CALL(connSetupCallback, onTransportReady());
+      EXPECT_CALL(connSetupCallback, onFullHandshakeDone()).Times(0);
     }
     recvClientHello();
+
+    EXPECT_CALL(connSetupCallback, onFullHandshakeDone()).Times(1);
 
     // If 0-rtt is disabled, one rtt write cipher will be available after CFIN
     // is processed
@@ -3910,7 +4149,7 @@ class QuicServerTransportHandshakeTest
   std::vector<folly::IPAddress> expectedSourceToken_;
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     QuicServerTransportHandshakeTests,
     QuicServerTransportHandshakeTest,
     Values(
@@ -3946,20 +4185,31 @@ TEST_P(
 }
 
 TEST_P(QuicServerTransportHandshakeTest, TestD6DStartCallback) {
-  Observer::Config config = {};
-  config.pmtuEvents = true;
-  auto mockObserver = std::make_unique<MockObserver>(config);
-  server->addObserver(mockObserver.get());
+  LegacyObserver::EventSet eventSet;
+  eventSet.enable(SocketObserverInterface::Events::pmtuEvents);
+
+  auto obs1 = std::make_unique<MockLegacyObserver>();
+  auto obs2 = std::make_unique<MockLegacyObserver>(eventSet);
+  auto obs3 = std::make_unique<MockLegacyObserver>(eventSet);
+  server->addObserver(obs1.get());
+  server->addObserver(obs2.get());
+  server->addObserver(obs3.get());
+
   // Set oneRttReader so that maybeStartD6DPriobing passes its check
   auto codec = std::make_unique<QuicReadCodec>(QuicNodeType::Server);
   codec->setOneRttReadCipher(createNoOpAead());
   server->getNonConstConn().readCodec = std::move(codec);
   // And the state too
   server->getNonConstConn().d6d.state = D6DMachineState::BASE;
-  EXPECT_CALL(*mockObserver, pmtuProbingStarted(_)).Times(1);
+  EXPECT_CALL(*obs1, pmtuProbingStarted(_)).Times(0); // not enabled
+  EXPECT_CALL(*obs2, pmtuProbingStarted(_)).Times(1);
+  EXPECT_CALL(*obs3, pmtuProbingStarted(_)).Times(1);
   // CHLO should be enough to trigger probing
   recvClientHello();
-  server->removeObserver(mockObserver.get());
+
+  server->removeObserver(obs1.get());
+  server->removeObserver(obs2.get());
+  server->removeObserver(obs3.get());
 }
 
 TEST_F(QuicUnencryptedServerTransportTest, DuplicateOneRttWriteCipher) {
@@ -4078,7 +4328,7 @@ TEST_F(QuicServerTransportTest, WriteDSR) {
   // Rinse anything pending
   server->writeData();
   loopForWrites();
-  server->getNonConstConn().outstandings.packets.clear();
+  server->getNonConstConn().outstandings.reset();
   getFakeHandshakeLayer()->setCipherSuite(
       fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
   auto streamId = server->createBidirectionalStream().value();

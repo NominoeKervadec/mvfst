@@ -59,13 +59,14 @@ QuicClientTransport::QuicClientTransport(
           evb,
           std::move(socket),
           useConnectionEndWithErrorCallback),
-      happyEyeballsConnAttemptDelayTimeout_(this) {
+      happyEyeballsConnAttemptDelayTimeout_(this),
+      observerContainer_(std::make_shared<SocketObserverContainer>(this)) {
   DCHECK(handshakeFactory);
   auto tempConn =
       std::make_unique<QuicClientConnectionState>(std::move(handshakeFactory));
   clientConn_ = tempConn.get();
   conn_.reset(tempConn.release());
-  conn_->observers = observers_;
+  conn_->observerContainer = observerContainer_;
 
   auto srcConnId = connectionIdSize > 0
       ? ConnectionId::createRandom(connectionIdSize)
@@ -891,6 +892,9 @@ void QuicClientTransport::writeData() {
         (conn_->ackStates.initialAckState.needsToSendAckImmediately &&
          hasAcksToSchedule(conn_->ackStates.initialAckState))) {
       CHECK(conn_->initialHeaderCipher);
+      std::string& token = clientConn_->retryToken.empty()
+          ? clientConn_->newToken
+          : clientConn_->retryToken;
       packetLimit -= writeCryptoAndAckDataToSocket(
                          *socket_,
                          *conn_,
@@ -901,7 +905,7 @@ void QuicClientTransport::writeData() {
                          *conn_->initialHeaderCipher,
                          version,
                          packetLimit,
-                         clientConn_->retryToken)
+                         token)
                          .packetsWritten;
     }
     if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
@@ -1009,6 +1013,12 @@ void QuicClientTransport::startCryptoHandshake() {
       conn_->clientConnectionId.value(),
       customTransportParameters_);
   conn_->transportParametersEncoded = true;
+  if (!conn_->transportSettings.flowPriming.empty() &&
+      conn_->peerAddress.isInitialized()) {
+    socket_->write(
+        conn_->peerAddress,
+        folly::IOBuf::copyBuffer(conn_->transportSettings.flowPriming));
+  }
   handshakeLayer->connect(hostname_, std::move(paramsExtension));
 
   writeSocketData();
@@ -1098,7 +1108,7 @@ void QuicClientTransport::getReadBuffer(void** buf, size_t* len) noexcept {
   DCHECK(conn_) << "trying to receive packets without a connection";
   auto readBufferSize =
       conn_->transportSettings.maxRecvPacketSize * numGROBuffers_;
-  readBuffer_ = folly::IOBuf::create(readBufferSize);
+  readBuffer_ = folly::IOBuf::createCombined(readBufferSize);
   *buf = readBuffer_->writableData();
   *len = readBufferSize;
 }
@@ -1204,7 +1214,7 @@ void QuicClientTransport::recvMsg(
     // We create 1 buffer per packet so that it is not shared, this enables
     // us to decrypt in place. If the fizz decrypt api could decrypt in-place
     // even if shared, then we could allocate one giant IOBuf here.
-    Buf readBuffer = folly::IOBuf::create(readBufferSize);
+    Buf readBuffer = folly::IOBuf::createCombined(readBufferSize);
     struct iovec vec {};
     vec.iov_base = readBuffer->writableData();
     vec.iov_len = readBufferSize;
@@ -1350,7 +1360,7 @@ void QuicClientTransport::recvMmsg(
   for (int i = 0; i < numPackets; ++i) {
     Buf readBuffer;
     if (freeBufs.empty()) {
-      readBuffer = folly::IOBuf::create(readBufferSize);
+      readBuffer = folly::IOBuf::createCombined(readBufferSize);
     } else {
       readBuffer = std::move(freeBufs.back());
       DCHECK(readBuffer != nullptr);
@@ -1528,7 +1538,7 @@ void QuicClientTransport::
 
 void QuicClientTransport::start(
     ConnectionSetupCallback* connSetupCb,
-    ConnectionCallbackNew* connCb) {
+    ConnectionCallback* connCb) {
   if (happyEyeballsEnabled_) {
     // TODO Supply v4 delay amount from somewhere when we want to tune this
     startHappyEyeballs(
@@ -1551,7 +1561,7 @@ void QuicClientTransport::start(
   }
 
   setConnectionSetupCallback(connSetupCb);
-  setConnectionCallbackNew(connCb);
+  setConnectionCallback(connCb);
 
   clientConn_->pendingOneRttData.reserve(
       conn_->transportSettings.maxPacketsToBuffer);

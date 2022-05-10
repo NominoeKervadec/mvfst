@@ -6,7 +6,6 @@
 add_library(
   mvfst_transport STATIC
   IoBufQuicBatch.cpp
-  Observer.cpp
   QuicBatchWriter.cpp
   QuicPacketScheduler.cpp
   QuicSocket.cpp
@@ -42,6 +41,7 @@ add_dependencies(
   mvfst_happyeyeballs
   mvfst_looper
   mvfst_loss
+  mvfst_observer
   mvfst_qlogger
   mvfst_socketutil
   mvfst_state_ack_handler
@@ -70,6 +70,7 @@ target_link_libraries(
   mvfst_happyeyeballs
   mvfst_looper
   mvfst_loss
+  mvfst_observer
   mvfst_qlogger
   mvfst_socketutil
   mvfst_state_ack_handler

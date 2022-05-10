@@ -5,10 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// #include <folly/portability/GMock.h>
-// #include <folly/portability/GTest.h>
-
 #include <quic/api/QuicTransportBase.h>
+#include <quic/common/test/TestPacketBuilders.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/StateData.h>
@@ -42,8 +40,9 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
    * Contains interval of OutstandingPackets that were just written.
    */
   struct NewOutstandingPacketInterval {
-    PacketNum start;
-    PacketNum end;
+    const PacketNum start;
+    const PacketNum end;
+    const TimePoint sentTime;
   };
 
   /**
@@ -71,7 +70,9 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
       return folly::none;
     }
     const auto& packet = it->packet;
+    const auto& metadata = it->metadata;
     const auto lastAppDataPacketNum = packet.header.getPacketSequenceNum();
+    const auto sendTime = metadata.time;
 
     // if packet number of last AppData packet < nextAppDataPacketNum, then
     // we sent nothing new and we have nothing to do...
@@ -81,22 +82,44 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
 
     // we sent new AppData packets
     return NewOutstandingPacketInterval{
-        preSendNextAppDataPacketNum, lastAppDataPacketNum};
+        preSendNextAppDataPacketNum, lastAppDataPacketNum, sendTime};
   }
 
   /**
-   * Returns the last outstanding packet written of the specified type.
+   * Returns the first outstanding packet written of the specified type.
+   *
+   * If no outstanding packets of the specified type, returns nullptr.
    *
    * Since this is a reference to a packet in the outstanding packets deque, it
    * should not be stored.
    */
   const OutstandingPacket* FOLLY_NULLABLE
-  getLastPacketWritten(const quic::PacketNumberSpace packetNumberSpace) {
+  getOldestOutstandingPacket(const quic::PacketNumberSpace packetNumberSpace) {
+    const auto outstandingPacketIt =
+        getFirstOutstandingPacket(this->getNonConstConn(), packetNumberSpace);
+    if (outstandingPacketIt ==
+        this->getNonConstConn().outstandings.packets.end()) {
+      return nullptr;
+    }
+    return &*outstandingPacketIt;
+  }
+
+  /**
+   * Returns the last outstanding packet written of the specified type.
+   *
+   * If no outstanding packets of the specified type, returns nullptr.
+   *
+   * Since this is a reference to a packet in the outstanding packets deque, it
+   * should not be stored.
+   */
+  const OutstandingPacket* FOLLY_NULLABLE
+  getNewestOutstandingPacket(const quic::PacketNumberSpace packetNumberSpace) {
     const auto outstandingPacketIt =
         getLastOutstandingPacket(this->getNonConstConn(), packetNumberSpace);
-    CHECK(
-        outstandingPacketIt !=
-        this->getNonConstConn().outstandings.packets.rend());
+    if (outstandingPacketIt ==
+        this->getNonConstConn().outstandings.packets.rend()) {
+      return nullptr;
+    }
     return &*outstandingPacketIt;
   }
 
@@ -108,8 +131,41 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
    * Since this is a reference to a packet in the outstanding packets deque, it
    * should not be stored.
    */
-  const OutstandingPacket* FOLLY_NULLABLE getLastAppDataPacketWritten() {
-    return getLastPacketWritten(PacketNumberSpace::AppData);
+  const OutstandingPacket* FOLLY_NULLABLE getNewestAppDataOutstandingPacket() {
+    return getNewestOutstandingPacket(PacketNumberSpace::AppData);
+  }
+
+  /**
+   * Acks all outstanding packets for the specified packet number space.
+   */
+  void ackAllOutstandingPackets(
+      quic::PacketNumberSpace pnSpace,
+      quic::TimePoint recvTime = TimePoint::clock::now()) {
+    auto oldestOutstandingPkt = getOldestOutstandingPacket(pnSpace);
+    auto newestOutstandingPkt = getNewestOutstandingPacket(pnSpace);
+    CHECK_EQ(oldestOutstandingPkt == nullptr, newestOutstandingPkt == nullptr);
+    if (!oldestOutstandingPkt) {
+      return;
+    }
+
+    QuicTransportTestClass::deliverData(
+        NetworkData(
+            buildAckPacketForSentPackets(
+                pnSpace,
+                oldestOutstandingPkt->packet.header.getPacketSequenceNum(),
+                newestOutstandingPkt->packet.header.getPacketSequenceNum()),
+            recvTime),
+        false /* loopForWrites */);
+  }
+
+  /**
+   * Acks all outstanding packets for all packet number spaces.
+   */
+  void ackAllOutstandingPackets(
+      quic::TimePoint recvTime = TimePoint::clock::now()) {
+    ackAllOutstandingPackets(quic::PacketNumberSpace::Initial, recvTime);
+    ackAllOutstandingPackets(quic::PacketNumberSpace::Handshake, recvTime);
+    ackAllOutstandingPackets(quic::PacketNumberSpace::AppData, recvTime);
   }
 
   /**
@@ -133,6 +189,26 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
   }
 
   /**
+   * Deliver multiple packets from the remote.
+   */
+  void deliverPackets(
+      std::vector<Buf>&& bufs,
+      quic::TimePoint recvTime = TimePoint::clock::now(),
+      bool loopForWrites = true) {
+    QuicTransportTestClass::deliverData(
+        NetworkData(std::move(bufs), recvTime), loopForWrites);
+  }
+
+  /**
+   * Deliver multiple packets from the remote, do not loop for writes.
+   */
+  void deliverPacketsNoWrites(
+      std::vector<Buf>&& bufs,
+      quic::TimePoint recvTime = TimePoint::clock::now()) {
+    deliverPackets(std::move(bufs), recvTime, false /* loopForWrites */);
+  }
+
+  /**
    * Build a packet with stream data from peer.
    */
   quic::Buf buildPeerPacketWithStreamData(
@@ -141,7 +217,7 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
     auto buf = quic::test::packetToBuf(createStreamPacket(
         getSrcConnectionId(),
         getDstConnectionId(),
-        ++peerNextAppDataPacketNum,
+        ++peerPacketNumStore.nextAppDataPacketNum,
         streamId,
         *data /* stream data */,
         0 /* cipherOverhead */,
@@ -164,7 +240,7 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
     auto buf = quic::test::packetToBuf(createStreamPacket(
         getSrcConnectionId(),
         getDstConnectionId(),
-        ++peerNextAppDataPacketNum,
+        ++peerPacketNumStore.nextAppDataPacketNum,
         streamId,
         *data /* stream data */,
         0 /* cipherOverhead */,
@@ -183,7 +259,7 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
     ShortHeader header(
         ProtectionType::KeyPhaseZero,
         getDstConnectionId(),
-        peerNextAppDataPacketNum++);
+        peerPacketNumStore.nextAppDataPacketNum++);
     RegularQuicPacketBuilder builder(
         getConn().udpSendPacketLen, std::move(header), 0 /* largestAcked */);
     builder.encodePacketHeader();
@@ -207,7 +283,7 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
     ShortHeader header(
         ProtectionType::KeyPhaseZero,
         getDstConnectionId(),
-        peerNextAppDataPacketNum++);
+        peerPacketNumStore.nextAppDataPacketNum++);
     RegularQuicPacketBuilder builder(
         getConn().udpSendPacketLen, std::move(header), 0 /* largestAcked */);
     builder.encodePacketHeader();
@@ -223,56 +299,90 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
   }
 
   /**
-   * Build a packet with ACK frame for previously sent AppData packet.
+   * Build a packet from peer with ACK frame for previously sent packets.
    */
-  quic::Buf buildAckPacketForSentAppDataPacket(quic::PacketNum packetNum) {
-    quic::AckBlocks acks = {{packetNum, packetNum}};
-    return buildAckPacketForSentAppDataPackets(acks);
-  }
-
-  /**
-   * Build a packet from peer with ACK frame for previously AppData packets.
-   */
-  quic::Buf buildAckPacketForSentAppDataPackets(quic::AckBlocks acks) {
-    auto buf = quic::test::packetToBuf(quic::test::createAckPacket(
-        getNonConstConn(),
-        ++peerNextAppDataPacketNum,
-        acks,
-        quic::PacketNumberSpace::AppData));
+  quic::Buf buildAckPacketForSentPackets(
+      quic::PacketNumberSpace pnSpace,
+      quic::AckBlocks acks,
+      std::chrono::microseconds ackDelay = 0us) {
+    auto buf =
+        quic::test::packetToBuf(AckPacketBuilder()
+                                    .setDstConn(&getNonConstConn())
+                                    .setPacketNumberSpace(pnSpace)
+                                    .setAckPacketNumStore(&peerPacketNumStore)
+                                    .setAckBlocks(acks)
+                                    .setAckDelay(ackDelay)
+                                    .build());
     buf->coalesce();
     return buf;
   }
 
   /**
+   * Build a packet from peer with ACK frame for previously sent packets.
+   */
+  quic::Buf buildAckPacketForSentPackets(
+      quic::PacketNumberSpace pnSpace,
+      quic::PacketNum intervalStart,
+      quic::PacketNum intervalEnd,
+      std::chrono::microseconds ackDelay = 0us) {
+    quic::AckBlocks acks = {{intervalStart, intervalEnd}};
+    return buildAckPacketForSentPackets(pnSpace, acks, ackDelay);
+  }
+
+  /**
+   * Build a packet from peer with ACK frame for previously sent AppData pkts.
+   */
+  quic::Buf buildAckPacketForSentAppDataPackets(
+      quic::AckBlocks acks,
+      std::chrono::microseconds ackDelay = 0us) {
+    return buildAckPacketForSentPackets(
+        quic::PacketNumberSpace::AppData, acks, ackDelay);
+  }
+
+  /**
+   * Build a packet with ACK frame for previously sent AppData packet.
+   */
+  quic::Buf buildAckPacketForSentAppDataPacket(
+      quic::PacketNum packetNum,
+      std::chrono::microseconds ackDelay = 0us) {
+    quic::AckBlocks acks = {{packetNum, packetNum}};
+    return buildAckPacketForSentAppDataPackets(acks, ackDelay);
+  }
+
+  /**
    * Build a packet with ACK frame for previously sent AppData packets.
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
-      NewOutstandingPacketInterval writeInterval) {
+      NewOutstandingPacketInterval writeInterval,
+      std::chrono::microseconds ackDelay = 0us) {
     const quic::PacketNum firstPacketNum = writeInterval.start;
     const quic::PacketNum lastPacketNum = writeInterval.end;
     quic::AckBlocks acks = {{firstPacketNum, lastPacketNum}};
-    return buildAckPacketForSentAppDataPackets(acks);
+    return buildAckPacketForSentAppDataPackets(acks, ackDelay);
   }
 
   /**
    * Build a packet with ACK frame for previously sent AppData packets.
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
-      folly::Optional<NewOutstandingPacketInterval> maybeWriteInterval) {
+      folly::Optional<NewOutstandingPacketInterval> maybeWriteInterval,
+      std::chrono::microseconds ackDelay = 0us) {
     CHECK(maybeWriteInterval.has_value());
-    return buildAckPacketForSentAppDataPackets(maybeWriteInterval.value());
+    return buildAckPacketForSentAppDataPackets(
+        maybeWriteInterval.value(), ackDelay);
   }
 
   /**
    * Build a packet with ACK frame for previously sent AppData packets.
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
-      std::vector<NewOutstandingPacketInterval> writeIntervals) {
+      std::vector<NewOutstandingPacketInterval> writeIntervals,
+      std::chrono::microseconds ackDelay = 0us) {
     quic::AckBlocks acks;
     for (const auto& writeInterval : writeIntervals) {
       acks.insert(writeInterval.start, writeInterval.end);
     }
-    return buildAckPacketForSentAppDataPackets(acks);
+    return buildAckPacketForSentAppDataPackets(acks, ackDelay);
   }
 
   /**
@@ -280,13 +390,14 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
       std::vector<folly::Optional<NewOutstandingPacketInterval>>
-          maybeWriteIntervals) {
+          maybeWriteIntervals,
+      std::chrono::microseconds ackDelay = 0us) {
     std::vector<NewOutstandingPacketInterval> writeIntervals;
     for (const auto& maybeWriteInterval : maybeWriteIntervals) {
       CHECK(maybeWriteInterval.has_value());
       writeIntervals.emplace_back(maybeWriteInterval.value());
     }
-    return buildAckPacketForSentAppDataPackets(writeIntervals);
+    return buildAckPacketForSentAppDataPackets(writeIntervals, ackDelay);
   }
 
   /**
@@ -294,31 +405,36 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
       quic::PacketNum intervalStart,
-      quic::PacketNum intervalEnd) {
+      quic::PacketNum intervalEnd,
+      std::chrono::microseconds ackDelay = 0us) {
     quic::AckBlocks acks = {{intervalStart, intervalEnd}};
-    return buildAckPacketForSentAppDataPackets(acks);
+    return buildAckPacketForSentAppDataPackets(acks, ackDelay);
   }
 
   /**
    * Build a packet with ACK frame for previously sent AppData packets.
    */
   quic::Buf buildAckPacketForSentAppDataPackets(
-      std::vector<quic::PacketNum> packetNums) {
+      const std::vector<quic::PacketNum>& packetNums,
+      std::chrono::microseconds ackDelay = 0us) {
     quic::AckBlocks acks;
     for (const auto& packetNum : packetNums) {
       acks.insert(packetNum, packetNum);
     }
-    return buildAckPacketForSentAppDataPackets(acks);
+    return buildAckPacketForSentAppDataPackets(acks, ackDelay);
   }
 
   /**
    * Build a packet from peer with ACK frame for previously AppData packets.
    */
   template <class T0, class... Ts>
-  quic::Buf buildAckPacketForSentAppDataPackets(T0&& first, Ts&&... args) {
+  quic::Buf buildAckPacketForSentAppDataPackets(
+      T0&& first,
+      Ts&&... args,
+      std::chrono::microseconds ackDelay = 0us) {
     std::vector<quic::PacketNum> packetNums{
         std::forward<T0>(first), std::forward<Ts>(args)...};
-    return buildAckPacketForSentAppDataPackets(packetNums);
+    return buildAckPacketForSentAppDataPackets(packetNums, ackDelay);
   }
 
   /**
@@ -603,7 +719,7 @@ class QuicTypedTransportTestBase : protected QuicTransportTestClass {
     return getPacketNumsFromIntervals(writeIntervals);
   }
 
-  quic::PacketNum peerNextAppDataPacketNum{0};
+  PacketNumStore peerPacketNumStore;
 };
 
 } // namespace quic::test

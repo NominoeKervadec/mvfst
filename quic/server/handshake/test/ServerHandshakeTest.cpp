@@ -36,10 +36,9 @@
 #include <quic/state/StateData.h>
 
 using namespace std;
-using namespace folly;
 using namespace testing;
 
-static constexpr StringPiece kTestHostname = "www.facebook.com";
+static constexpr folly::StringPiece kTestHostname = "www.facebook.com";
 
 namespace quic {
 namespace test {
@@ -47,7 +46,7 @@ class MockServerHandshakeCallback : public ServerHandshake::HandshakeCallback {
  public:
   ~MockServerHandshakeCallback() override = default;
 
-  GMOCK_METHOD0_(, noexcept, , onCryptoEventAvailable, void());
+  MOCK_METHOD(void, onCryptoEventAvailable, (), (noexcept));
 };
 
 struct TestingServerConnectionState : public QuicServerConnectionState {
@@ -423,26 +422,28 @@ class AsyncRejectingTicketCipher : public fizz::server::TicketCipher {
  public:
   ~AsyncRejectingTicketCipher() override = default;
 
-  folly::Future<folly::Optional<
+  folly::SemiFuture<folly::Optional<
       std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>
   encrypt(fizz::server::ResumptionState) const override {
     if (!encryptAsync_) {
-      return std::make_pair(IOBuf::create(0), 2s);
+      return std::make_pair(folly::IOBuf::create(0), 2s);
     } else {
       encryptAsync_ = false;
-      return std::move(encryptFuture_).thenValue([](auto&&) {
+      return std::move(encryptFuture_).deferValue([](auto&&) {
         VLOG(1) << "got ticket async";
-        return std::make_pair(IOBuf::create(0), 2s);
+        return folly::makeSemiFuture<folly::Optional<
+            std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>(
+            std::make_pair(folly::IOBuf::create(0), 2s));
       });
     }
   }
 
-  void setDecryptAsync(bool async, folly::Future<folly::Unit> future) {
+  void setDecryptAsync(bool async, folly::SemiFuture<folly::Unit> future) {
     decryptAsync_ = async;
     decryptFuture_ = std::move(future);
   }
 
-  void setEncryptAsync(bool async, folly::Future<folly::Unit> future) {
+  void setEncryptAsync(bool async, folly::SemiFuture<folly::Unit> future) {
     encryptAsync_ = async;
     encryptFuture_ = std::move(future);
   }
@@ -451,7 +452,7 @@ class AsyncRejectingTicketCipher : public fizz::server::TicketCipher {
     error_ = error;
   }
 
-  folly::Future<
+  folly::SemiFuture<
       std::pair<fizz::PskType, folly::Optional<fizz::server::ResumptionState>>>
   decrypt(std::unique_ptr<folly::IOBuf>) const override {
     if (!decryptAsync_) {
@@ -461,19 +462,22 @@ class AsyncRejectingTicketCipher : public fizz::server::TicketCipher {
       return std::make_pair(fizz::PskType::Rejected, folly::none);
     } else {
       decryptAsync_ = false;
-      return std::move(decryptFuture_).thenValue([&](auto&&) {
+      return std::move(decryptFuture_).deferValue([&](auto&&) {
         VLOG(1) << "triggered reject";
         if (error_) {
           throw std::runtime_error("test decrypt error");
         }
-        return std::make_pair(fizz::PskType::Rejected, folly::none);
+        return folly::makeSemiFuture<std::pair<
+            fizz::PskType,
+            folly::Optional<fizz::server::ResumptionState>>>(
+            std::make_pair(fizz::PskType::Rejected, folly::none));
       });
     }
   }
 
  private:
-  mutable folly::Future<folly::Unit> decryptFuture_;
-  mutable folly::Future<folly::Unit> encryptFuture_;
+  mutable folly::SemiFuture<folly::Unit> decryptFuture_;
+  mutable folly::SemiFuture<folly::Unit> encryptFuture_;
   mutable bool decryptAsync_{true};
   mutable bool encryptAsync_{false};
   bool error_{false};
@@ -752,11 +756,11 @@ class ServerHandshakeZeroRttDefaultAppTokenValidatorTest
    public:
     ~AcceptingTicketCipher() override = default;
 
-    folly::Future<folly::Optional<
+    folly::SemiFuture<folly::Optional<
         std::pair<std::unique_ptr<folly::IOBuf>, std::chrono::seconds>>>
     encrypt(fizz::server::ResumptionState) const override {
       // Fake handshake, no need todo anything here.
-      return std::make_pair(IOBuf::create(0), 2s);
+      return std::make_pair(folly::IOBuf::create(0), 2s);
     }
 
     void setPsk(fizz::client::CachedPsk psk) {
@@ -769,7 +773,7 @@ class ServerHandshakeZeroRttDefaultAppTokenValidatorTest
       resState.serverCert = psk.serverCert;
     }
 
-    folly::Future<std::pair<
+    folly::SemiFuture<std::pair<
         fizz::PskType,
         folly::Optional<fizz::server::ResumptionState>>>
     decrypt(std::unique_ptr<folly::IOBuf>) const override {

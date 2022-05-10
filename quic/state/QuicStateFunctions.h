@@ -30,8 +30,8 @@ void updateAckSendStateOnSentPacketWithAcks(
 
 void updateRtt(
     QuicConnectionStateBase& conn,
-    std::chrono::microseconds rttSample,
-    std::chrono::microseconds ackDelay);
+    const std::chrono::microseconds rttSample,
+    const std::chrono::microseconds ackDelay);
 
 bool isConnectionPaced(const QuicConnectionStateBase& conn) noexcept;
 
@@ -116,5 +116,7 @@ std::pair<folly::Optional<TimePoint>, PacketNumberSpace> earliestLossTimer(
 std::pair<folly::Optional<TimePoint>, PacketNumberSpace> earliestTimeAndSpace(
     const EnumArray<PacketNumberSpace, folly::Optional<TimePoint>>& times,
     bool considerAppData) noexcept;
+
+uint64_t maximumConnectionIdsToIssue(const QuicConnectionStateBase& conn);
 
 } // namespace quic

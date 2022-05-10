@@ -10,19 +10,108 @@
 #include <folly/Optional.h>
 #include <folly/container/F14Map.h>
 #include <quic/codec/Types.h>
+#include <quic/congestion_control/CongestionController.h>
 #include <quic/state/OutstandingPacket.h>
 
 namespace quic {
 
 struct AckEvent {
+  struct AckPacket;
+
+  /**
+   * Returns the AckPacket associated with the AckEvent's RttSample.
+   *
+   * Can be used to get packet metadata, including send time, app limited state,
+   * and other aspects. For RTT measurements, this can be used to determine the
+   * number of packets / bytes inflight at the time the corresponding packet was
+   * sent, which in turn can be used to infer whether the RTT measurement could
+   * have been subject to self-induced congestion.
+   *
+   * If the OutstandingPacket with the largestAckedPacket packet number had
+   * already been acked or removed from the list of list of OutstandingPackets,
+   * either due to being marked lost or acked by an earlier AckEvent, then this
+   * information will be unavailable.
+   *
+   * Equivalent to getLargestAckedPacket() unless this is an implicit AckEvent
+   * (for which RttSamples are unavailable); this helper exists to make it
+   * easier to find this information.
+   */
+  [[nodiscard]] const AckPacket* FOLLY_NULLABLE
+  getRttSampleAckedPacket() const {
+    if (!rttSample) {
+      return nullptr;
+    }
+    return getLargestAckedPacket();
+  }
+
+  /**
+   * Returns the AckPacket associated with the largestAckedPacket.
+   *
+   * The largestAckedPacket is included in the AckFrame received from sender.
+   *
+   * Can be used to get packet metadata, including send time, app limited state,
+   * and other aspects.
+   *
+   * If the OutstandingPacket with the largestAckedPacket packet number had
+   * already been acked or removed from the list of list of OutstandingPackets,
+   * either due to being marked lost or acked by an earlier AckEvent, then this
+   * information will be unavailable.
+   */
+  [[nodiscard]] const AckPacket* FOLLY_NULLABLE getLargestAckedPacket() const {
+    for (const auto& packet : ackedPackets) {
+      if (packet.packetNum == largestAckedPacket) {
+        return &packet;
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * Returns the AckPacket associated with the largestNewlyAckedPacket.
+   *
+   * Can be used to get packet metadata, including send time, app limited state,
+   * and other aspects.
+   */
+  [[nodiscard]] const AckPacket* FOLLY_NULLABLE
+  getLargestNewlyAckedPacket() const {
+    if (!largestNewlyAckedPacket.has_value()) {
+      return nullptr;
+    }
+    for (const auto& packet : ackedPackets) {
+      if (packet.packetNum == largestNewlyAckedPacket) {
+        return &packet;
+      }
+    }
+    return nullptr;
+  }
+
   // ack receive time
   const TimePoint ackTime;
 
-  // ack receive time minus ack delay
+  // ack receive time minus ack delay.
   const TimePoint adjustedAckTime;
 
-  // packet number space that (newly) acked packets are in
+  // ack delay
+  //
+  // the ack delay is the amount of time between the remote receiving
+  // largestAckedPacket and the remote generating the AckFrame associated with
+  // this AckEvent.
+  //
+  // different AckFrame can have the same largestAckedPacket with different ack
+  // blocks (ranges) in the case of reordering; under such circumstances, you
+  // cannot use the ack delay if the largestAckedPacket was already acknowledged
+  // by a previous AckFrame.
+  const std::chrono::microseconds ackDelay;
+
+  // packet number space that acked packets are in.
   const PacketNumberSpace packetNumberSpace;
+
+  // the largest acked packet included in the AckFrame received from sender.
+  //
+  // this may not be the same as largestNewlyAckedPacket (below) if the
+  // OutstandingPacket with this packet number had already been removed from the
+  // list of OutstandingPackets, either due to being marked lost or acked.
+  const PacketNum largestAckedPacket;
 
   // for all packets (newly) acked during this event, sum of encoded sizes
   // encoded size includes header and body
@@ -32,18 +121,34 @@ struct AckEvent {
   // determine information about stream bytes.
   uint64_t ackedBytes{0};
 
-  // the highest packet number (newly) acked by this event
+  // the highest packet number newly acked during processing of this event.
   //
-  // the reason that this is an optional type, is that we construct an
+  // this may not be the same as the largestAckedPacket if the OutstandingPacket
+  // with that packet number had already been acked or removed from the list of
+  // list of OutstandingPackets, either due to being marked lost or acked.
+  //
+  // the reason that this is an optional type is that we construct an
   // AckEvent first, then go through the acked packets that are still
-  // outstanding, and figure out the largest acked packet along the way.
-  folly::Optional<PacketNum> largestAckedPacket;
+  // outstanding and figure out the largest newly acked packet along the way.
+  folly::Optional<PacketNum> largestNewlyAckedPacket;
 
-  // when largestAckedPacket was sent
-  TimePoint largestAckedPacketSentTime;
+  // when largestNewlyAckedPacket was sent
+  TimePoint largestNewlyAckedPacketSentTime;
 
-  // minimal RTT sample among packets newly acked; includes ack delay
-  folly::Optional<std::chrono::microseconds> mrttSample;
+  // RTT sample with ack delay included.
+  //
+  // not available if largestAckedPacket already acked or declared lost
+  folly::Optional<std::chrono::microseconds> rttSample;
+
+  // RTT sample with ack delay removed.
+  //
+  // not available if largestAckedPacket already acked or declared lost
+  folly::Optional<std::chrono::microseconds> rttSampleNoAckDelay;
+
+  // Congestion controller state after processing of AckEvent.
+  //
+  // Optional to handle cases where congestion controller not used.
+  folly::Optional<CongestionController::State> ccState;
 
   /**
    * Booleans grouped together to avoid padding.
@@ -52,8 +157,8 @@ struct AckEvent {
   // if this AckEvent came from an implicit ACK rather than a real one
   bool implicit{false};
 
-  // whether the transport was app limited when largestAckedPacket was sent
-  bool largestAckedPacketAppLimited{false};
+  // whether the transport was app limited when largestNewlyAckedPacket was sent
+  bool largestNewlyAckedPacketAppLimited{false};
 
   /**
    * Container to store information about ACKed packets
@@ -215,7 +320,9 @@ struct AckEvent {
   struct BuilderFields {
     folly::Optional<TimePoint> maybeAckTime;
     folly::Optional<TimePoint> maybeAdjustedAckTime;
+    folly::Optional<std::chrono::microseconds> maybeAckDelay;
     folly::Optional<PacketNumberSpace> maybePacketNumberSpace;
+    folly::Optional<PacketNum> maybeLargestAckedPacket;
     bool isImplicitAck{false};
     explicit BuilderFields() = default;
   };
@@ -223,7 +330,9 @@ struct AckEvent {
   struct Builder : public BuilderFields {
     Builder&& setAckTime(TimePoint ackTimeIn);
     Builder&& setAdjustedAckTime(TimePoint adjustedAckTimeIn);
+    Builder&& setAckDelay(std::chrono::microseconds ackDelay);
     Builder&& setPacketNumberSpace(PacketNumberSpace packetNumberSpaceIn);
+    Builder&& setLargestAckedPacket(PacketNum largestAckedPacketIn);
     Builder&& setIsImplicitAck(bool isImplicitAckIn);
     AckEvent build() &&;
     explicit Builder() = default;

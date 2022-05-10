@@ -37,6 +37,7 @@ QuicTransportBase::QuicTransportBase(
       ackTimeout_(this),
       pathValidationTimeout_(this),
       idleTimeout_(this),
+      keepaliveTimeout_(this),
       drainTimeout_(this),
       pingTimeout_(this),
       d6dProbeTimeout_(this),
@@ -158,13 +159,10 @@ QuicTransportBase::~QuicTransportBase() {
     sock->pauseRead();
     sock->close();
   }
-  for (const auto& cb : *observers_) {
-    cb->destroy(this);
-  }
 }
 
 bool QuicTransportBase::good() const {
-  return hasWriteCipher() && !error();
+  return closeState_ == CloseState::OPEN && hasWriteCipher() && !error();
 }
 
 bool QuicTransportBase::replaySafe() const {
@@ -248,8 +246,11 @@ void QuicTransportBase::closeImpl(
     return;
   }
 
-  for (const auto& cb : *observers_) {
-    cb->close(this, errorCode);
+  if (getSocketObserverContainer()) {
+    getSocketObserverContainer()->invokeInterfaceMethodAllObservers(
+        [errorCode](auto observer, auto observed) {
+          observer->close(observed, errorCode);
+        });
   }
 
   drainConnection = drainConnection & conn_->transportSettings.shouldDrain;
@@ -358,6 +359,9 @@ void QuicTransportBase::closeImpl(
   if (idleTimeout_.isScheduled()) {
     idleTimeout_.cancelTimeout();
   }
+  if (keepaliveTimeout_.isScheduled()) {
+    keepaliveTimeout_.cancelTimeout();
+  }
   if (pingTimeout_.isScheduled()) {
     pingTimeout_.cancelTimeout();
   }
@@ -403,9 +407,7 @@ void QuicTransportBase::closeImpl(
   resetConnectionCallbacks();
 
   // Don't need outstanding packets.
-  conn_->outstandings.packets.clear();
-  conn_->outstandings.packetCount = {};
-  conn_->outstandings.clonedPacketCount = {};
+  conn_->outstandings.reset();
 
   // We don't need no congestion control.
   conn_->congestionController = nullptr;
@@ -477,6 +479,7 @@ void QuicTransportBase::processConnectionCallbacks(
     return;
   }
 
+  QUIC_STATS(conn_->statsCallback, onConnectionClose, cancelCode.code);
   if (useConnectionEndWithErrorCallback_) {
     connCallback_->onConnectionEnd(cancelCode);
     return;
@@ -576,9 +579,12 @@ QuicSocket::TransportInfo QuicTransportBase::getTransportInfo() const {
   transportInfo.srtt = conn_->lossState.srtt;
   transportInfo.rttvar = conn_->lossState.rttvar;
   transportInfo.lrtt = conn_->lossState.lrtt;
+  transportInfo.maybeLrtt = conn_->lossState.maybeLrtt;
+  transportInfo.maybeLrttAckDelay = conn_->lossState.maybeLrttAckDelay;
   if (conn_->lossState.mrtt != kDefaultMinRtt) {
     transportInfo.maybeMinRtt = conn_->lossState.mrtt;
   }
+  transportInfo.maybeMinRttNoAckDelay = conn_->lossState.maybeMrttNoAckDelay;
   transportInfo.mss = conn_->udpSendPacketLen;
   transportInfo.congestionControlType = congestionControlType;
   transportInfo.writableBytes = writableBytes;
@@ -1476,13 +1482,18 @@ void QuicTransportBase::processCallbacksAfterWriteData() {
 void QuicTransportBase::handleKnobCallbacks() {
   for (auto& knobFrame : conn_->pendingEvents.knobs) {
     if (knobFrame.knobSpace != kDefaultQuicTransportKnobSpace) {
-      for (const auto& cb : *observers_) {
-        if (cb->getConfig().knobFrameEvents) {
-          cb->knobFrameReceived(
-              this, quic::Observer::KnobFrameEvent(Clock::now(), knobFrame));
-        }
+      if (getSocketObserverContainer() &&
+          getSocketObserverContainer()
+              ->hasObserversForEvent<
+                  SocketObserverInterface::Events::knobFrameEvents>()) {
+        getSocketObserverContainer()
+            ->invokeInterfaceMethod<
+                SocketObserverInterface::Events::knobFrameEvents>(
+                [event = quic::SocketObserverInterface::KnobFrameEvent(
+                     Clock::now(), knobFrame)](auto observer, auto observed) {
+                  observer->knobFrameReceived(observed, event);
+                });
       }
-
       connCallback_->onKnob(
           knobFrame.knobSpace, knobFrame.id, std::move(knobFrame.blob));
     } else {
@@ -1494,19 +1505,26 @@ void QuicTransportBase::handleKnobCallbacks() {
 }
 
 void QuicTransportBase::handleAckEventCallbacks() {
-  const auto& lastProcessedAckEvents = conn_->lastProcessedAckEvents;
+  auto& lastProcessedAckEvents = conn_->lastProcessedAckEvents;
   if (lastProcessedAckEvents.empty()) {
     return; // nothing to do
   }
 
-  const auto event = quic::Observer::AcksProcessedEvent::Builder()
-                         .setAckEvents(lastProcessedAckEvents)
-                         .build();
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().acksProcessedEvents) {
-      cb->acksProcessed(this, event);
-    }
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::acksProcessedEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<
+            SocketObserverInterface::Events::acksProcessedEvents>(
+            [event =
+                 quic::SocketObserverInterface::AcksProcessedEvent::Builder()
+                     .setAckEvents(lastProcessedAckEvents)
+                     .build()](auto observer, auto observed) {
+              observer->acksProcessed(observed, event);
+            });
   }
+  lastProcessedAckEvents.clear();
 }
 
 void QuicTransportBase::handleCancelByteEventCallbacks() {
@@ -1533,14 +1551,21 @@ void QuicTransportBase::handleNewStreamCallbacks(
     } else {
       connCallback_->onNewUnidirectionalStream(streamId);
     }
-    const Observer::StreamOpenEvent streamEvent(
-        streamId,
-        getStreamInitiator(streamId),
-        getStreamDirectionality(streamId));
-    for (const auto& cb : *observers_) {
-      if (cb->getConfig().streamEvents) {
-        cb->streamOpened(this, streamEvent);
-      }
+
+    if (getSocketObserverContainer() &&
+        getSocketObserverContainer()
+            ->hasObserversForEvent<
+                SocketObserverInterface::Events::streamEvents>()) {
+      getSocketObserverContainer()
+          ->invokeInterfaceMethod<
+              SocketObserverInterface::Events::streamEvents>(
+              [event = SocketObserverInterface::StreamOpenEvent(
+                   streamId,
+                   getStreamInitiator(streamId),
+                   getStreamDirectionality(streamId))](
+                  auto observer, auto observed) {
+                observer->streamOpened(observed, event);
+              });
     }
 
     if (closeState_ != CloseState::OPEN) {
@@ -1697,12 +1722,6 @@ void QuicTransportBase::processCallbacksAfterNetworkData() {
     return;
   }
 
-  // to call any callbacks added for observers
-  for (const auto& callback : conn_->pendingCallbacks) {
-    callback(this);
-  }
-  conn_->pendingCallbacks.clear();
-
   handlePingCallbacks();
   if (closeState_ != CloseState::OPEN) {
     return;
@@ -1758,14 +1777,42 @@ void QuicTransportBase::onNetworkData(
     updateWriteLooper(true);
   };
   try {
-    conn_->lastProcessedAckEvents.clear();
     conn_->lossState.totalBytesRecvd += networkData.totalData;
     auto originalAckVersion = currentAckStateVersion(*conn_);
+
+    // handle PacketsReceivedEvent if requested by observers
+    if (getSocketObserverContainer() &&
+        getSocketObserverContainer()
+            ->hasObserversForEvent<
+                SocketObserverInterface::Events::packetsReceivedEvents>()) {
+      auto builder = SocketObserverInterface::PacketsReceivedEvent::Builder()
+                         .setReceiveLoopTime(TimePoint::clock::now())
+                         .setNumPacketsReceived(networkData.packets.size())
+                         .setNumBytesReceived(networkData.totalData);
+      for (auto& packet : networkData.packets) {
+        builder.addReceivedPacket(
+            SocketObserverInterface::PacketsReceivedEvent::ReceivedPacket::
+                Builder()
+                    .setPacketReceiveTime(networkData.receiveTimePoint)
+                    .setPacketNumBytes(packet->computeChainDataLength())
+                    .build());
+      }
+
+      getSocketObserverContainer()
+          ->invokeInterfaceMethod<
+              SocketObserverInterface::Events::packetsReceivedEvents>(
+              [event = std::move(builder).build()](
+                  auto observer, auto observed) {
+                observer->packetsReceived(observed, event);
+              });
+    }
+
     for (auto& packet : networkData.packets) {
       onReadData(
           peer,
           NetworkDataSingle(std::move(packet), networkData.receiveTimePoint));
     }
+
     processCallbacksAfterNetworkData();
     if (closeState_ != CloseState::CLOSED) {
       if (currentAckStateVersion(*conn_) != originalAckVersion) {
@@ -1833,6 +1880,9 @@ void QuicTransportBase::setIdleTimer() {
   if (idleTimeout_.isScheduled()) {
     idleTimeout_.cancelTimeout();
   }
+  if (keepaliveTimeout_.isScheduled()) {
+    keepaliveTimeout_.cancelTimeout();
+  }
   auto localIdleTimeout = conn_->transportSettings.idleTimeout;
   // The local idle timeout being zero means it is disabled.
   if (localIdleTimeout == 0ms) {
@@ -1842,6 +1892,13 @@ void QuicTransportBase::setIdleTimer() {
       conn_->peerIdleTimeout > 0ms ? conn_->peerIdleTimeout : localIdleTimeout;
   auto idleTimeout = timeMin(localIdleTimeout, peerIdleTimeout);
   getEventBase()->timer().scheduleTimeout(&idleTimeout_, idleTimeout);
+  auto idleTimeoutCount = idleTimeout.count();
+  if (conn_->transportSettings.enableKeepalive) {
+    std::chrono::milliseconds keepaliveTimeout = std::chrono::milliseconds(
+        idleTimeoutCount - static_cast<int64_t>(idleTimeoutCount * .15));
+    getEventBase()->timer().scheduleTimeout(
+        &keepaliveTimeout_, keepaliveTimeout);
+  }
 }
 
 uint64_t QuicTransportBase::getNumOpenableBidirectionalStreams() const {
@@ -1865,15 +1922,23 @@ QuicTransportBase::createStreamInternal(bool bidirectional) {
   }
   if (streamResult) {
     const StreamId streamId = streamResult.value()->id;
-    const Observer::StreamOpenEvent streamEvent(
-        streamId,
-        getStreamInitiator(streamId),
-        getStreamDirectionality(streamId));
-    for (const auto& cb : *observers_) {
-      if (cb->getConfig().streamEvents) {
-        cb->streamOpened(this, streamEvent);
-      }
+
+    if (getSocketObserverContainer() &&
+        getSocketObserverContainer()
+            ->hasObserversForEvent<
+                SocketObserverInterface::Events::streamEvents>()) {
+      getSocketObserverContainer()
+          ->invokeInterfaceMethod<
+              SocketObserverInterface::Events::streamEvents>(
+              [event = SocketObserverInterface::StreamOpenEvent(
+                   streamId,
+                   getStreamInitiator(streamId),
+                   getStreamDirectionality(streamId))](
+                  auto observer, auto observed) {
+                observer->streamOpened(observed, event);
+              });
     }
+
     return streamId;
   } else {
     return folly::makeUnexpected(streamResult.error());
@@ -2373,14 +2438,21 @@ void QuicTransportBase::checkForClosedStream() {
   auto itr = conn_->streamManager->closedStreams().begin();
   while (itr != conn_->streamManager->closedStreams().end()) {
     const auto& streamId = *itr;
-    const Observer::StreamCloseEvent streamEvent(
-        streamId,
-        getStreamInitiator(streamId),
-        getStreamDirectionality(streamId));
-    for (const auto& cb : *observers_) {
-      if (cb->getConfig().streamEvents) {
-        cb->streamClosed(this, streamEvent);
-      }
+
+    if (getSocketObserverContainer() &&
+        getSocketObserverContainer()
+            ->hasObserversForEvent<
+                SocketObserverInterface::Events::streamEvents>()) {
+      getSocketObserverContainer()
+          ->invokeInterfaceMethod<
+              SocketObserverInterface::Events::streamEvents>(
+              [event = SocketObserverInterface::StreamCloseEvent(
+                   streamId,
+                   getStreamInitiator(streamId),
+                   getStreamDirectionality(streamId))](
+                  auto observer, auto observed) {
+                observer->streamClosed(observed, event);
+              });
     }
 
     // We may be in an active read cb when we close the stream
@@ -2547,6 +2619,12 @@ void QuicTransportBase::idleTimeoutExpired(bool drain) noexcept {
       !drain /* sendCloseImmediately */);
 }
 
+void QuicTransportBase::keepaliveTimeoutExpired() noexcept {
+  FOLLY_MAYBE_UNUSED auto self = sharedGuard();
+  conn_->pendingEvents.sendPing = true;
+  updateWriteLooper(true);
+}
+
 void QuicTransportBase::d6dProbeTimeoutExpired() noexcept {
   VLOG(4) << __func__ << " " << *this;
   FOLLY_MAYBE_UNUSED auto self = sharedGuard();
@@ -2705,8 +2783,7 @@ void QuicTransportBase::setConnectionSetupCallback(
   connSetupCallback_ = callback;
 }
 
-void QuicTransportBase::setConnectionCallbackNew(
-    ConnectionCallbackNew* callback) {
+void QuicTransportBase::setConnectionCallback(ConnectionCallback* callback) {
   connCallback_ = callback;
 }
 
@@ -2803,30 +2880,6 @@ void QuicTransportBase::resetNonControlStreams(
   }
 }
 
-void QuicTransportBase::addObserver(Observer* observer) {
-  // adding the same observer multiple times is not allowed
-  CHECK(
-      std::find(observers_->begin(), observers_->end(), observer) ==
-      observers_->end());
-
-  observers_->push_back(CHECK_NOTNULL(observer));
-  observer->observerAttach(this);
-}
-
-bool QuicTransportBase::removeObserver(Observer* observer) {
-  auto it = std::find(observers_->begin(), observers_->end(), observer);
-  if (it == observers_->end()) {
-    return false;
-  }
-  observer->observerDetach(this);
-  observers_->erase(it);
-  return true;
-}
-
-const ObserverVec& QuicTransportBase::getObservers() const {
-  return *observers_;
-}
-
 QuicConnectionStats QuicTransportBase::getConnectionsStats() const {
   QuicConnectionStats connStats;
   if (!conn_) {
@@ -2841,6 +2894,7 @@ QuicConnectionStats QuicTransportBase::getConnectionsStats() const {
   }
   connStats.ptoCount = conn_->lossState.ptoCount;
   connStats.srtt = conn_->lossState.srtt;
+  connStats.mrtt = conn_->lossState.mrtt;
   connStats.rttvar = conn_->lossState.rttvar;
   connStats.peerAckDelayExponent = conn_->peerAckDelayExponent;
   connStats.udpSendPacketLen = conn_->udpSendPacketLen;
@@ -2965,6 +3019,7 @@ void QuicTransportBase::writeSocketData() {
     ++(conn_->writeCount); // incremented on each write (or write attempt)
 
     // record current number of sent packets to detect delta
+    const auto beforeTotalBytesSent = conn_->lossState.totalBytesSent;
     const auto beforeTotalPacketsSent = conn_->lossState.totalPacketsSent;
     const auto beforeTotalAckElicitingPacketsSent =
         conn_->lossState.totalAckElicitingPacketsSent;
@@ -2986,6 +3041,7 @@ void QuicTransportBase::writeSocketData() {
       setLossDetectionAlarm(*conn_, *this);
 
       // check for change in number of packets
+      const auto afterTotalBytesSent = conn_->lossState.totalBytesSent;
       const auto afterTotalPacketsSent = conn_->lossState.totalPacketsSent;
       const auto afterTotalAckElicitingPacketsSent =
           conn_->lossState.totalAckElicitingPacketsSent;
@@ -3006,13 +3062,14 @@ void QuicTransportBase::writeSocketData() {
            beforeTotalAckElicitingPacketsSent);
 
       // if packets sent, notify observers
-      if (newPackets && conn_->congestionController) {
+      if (newPackets) {
         notifyPacketsWritten(
             afterTotalPacketsSent - beforeTotalPacketsSent
             /* numPacketsWritten */,
             afterTotalAckElicitingPacketsSent -
                 beforeTotalAckElicitingPacketsSent
-            /* numAckElicitingPacketsWritten */);
+            /* numAckElicitingPacketsWritten */,
+            afterTotalBytesSent - beforeTotalBytesSent /* numBytesWritten */);
       }
       if (conn_->loopDetectorCallback && newOutstandingPackets) {
         conn_->writeDebugState.currentEmptyLoopCount = 0;
@@ -3132,7 +3189,9 @@ void QuicTransportBase::setTransportSettings(
     if (writeLooper_->hasPacingTimer()) {
       bool usingBbr =
           (conn_->transportSettings.defaultCongestionController ==
-           CongestionControlType::BBR);
+               CongestionControlType::BBR ||
+           conn_->transportSettings.defaultCongestionController ==
+               CongestionControlType::BBRTesting);
       auto minCwnd = usingBbr ? kMinCwndInMssForBbr
                               : conn_->transportSettings.minCwndInMss;
       conn_->pacer = std::make_unique<TokenlessPacer>(*conn_, minCwnd);
@@ -3200,7 +3259,10 @@ bool QuicTransportBase::isKnobSupported() const {
   // support and incorporate it into the check, such that if the QUIC version
   // increases/changes, this method will still continue to work, based on the
   // transport parameter setting.
-  return (conn_->version && (*(conn_->version) == QuicVersion::MVFST));
+  return (
+      conn_->version &&
+      (*(conn_->version) == QuicVersion::MVFST ||
+       *(conn_->version) == QuicVersion::MVFST_EXPERIMENTAL));
 }
 
 const TransportSettings& QuicTransportBase::getTransportSettings() const {
@@ -3293,10 +3355,15 @@ void QuicTransportBase::attachEventBase(folly::EventBase* evb) {
   updatePeekLooper();
   updateWriteLooper(false);
 
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().evbEvents) {
-      cb->evbAttach(this, evb_);
-    }
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::evbEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<SocketObserverInterface::Events::evbEvents>(
+            [evb](auto observer, auto observed) {
+              observer->evbAttach(observed, evb);
+            });
   }
 }
 
@@ -3312,16 +3379,23 @@ void QuicTransportBase::detachEventBase() {
   ackTimeout_.cancelTimeout();
   pathValidationTimeout_.cancelTimeout();
   idleTimeout_.cancelTimeout();
+  keepaliveTimeout_.cancelTimeout();
   drainTimeout_.cancelTimeout();
   readLooper_->detachEventBase();
   peekLooper_->detachEventBase();
   writeLooper_->detachEventBase();
 
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().evbEvents) {
-      cb->evbDetach(this, evb_);
-    }
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::evbEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<SocketObserverInterface::Events::evbEvents>(
+            [evb = evb_.load()](auto observer, auto observed) {
+              observer->evbDetach(observed, evb);
+            });
   }
+
   evb_ = nullptr;
 }
 
@@ -3512,43 +3586,102 @@ QuicSocket::WriteResult QuicTransportBase::setDSRPacketizationRequestSender(
 }
 
 void QuicTransportBase::notifyStartWritingFromAppRateLimited() {
-  const auto event = Observer::AppLimitedEvent::Builder()
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::appRateLimitedEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<
+            SocketObserverInterface::Events::appRateLimitedEvents>(
+            [event = SocketObserverInterface::AppLimitedEvent::Builder()
                          .setOutstandingPackets(conn_->outstandings.packets)
                          .setWriteCount(conn_->writeCount)
-                         .build();
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().appRateLimitedEvents) {
-      cb->startWritingFromAppLimited(this, event);
-    }
+                         .setLastPacketSentTime(
+                             conn_->lossState.maybeLastPacketSentTime)
+                         .setCwndInBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getCongestionWindow())
+                                 : folly::none)
+                         .setWritableBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getWritableBytes())
+                                 : folly::none)
+                         .build()](auto observer, auto observed) {
+              observer->startWritingFromAppLimited(observed, event);
+            });
   }
 }
 
 void QuicTransportBase::notifyPacketsWritten(
     uint64_t numPacketsWritten,
-    uint64_t numAckElicitingPacketsWritten) {
-  const auto event =
-      Observer::PacketsWrittenEvent::Builder()
-          .setOutstandingPackets(conn_->outstandings.packets)
-          .setWriteCount(conn_->writeCount)
-          .setNumPacketsWritten(numPacketsWritten)
-          .setNumAckElicitingPacketsWritten(numAckElicitingPacketsWritten)
-          .build();
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().packetsWrittenEvents) {
-      cb->packetsWritten(this, event);
-    }
+    uint64_t numAckElicitingPacketsWritten,
+    uint64_t numBytesWritten) {
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::packetsWrittenEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<
+            SocketObserverInterface::Events::packetsWrittenEvents>(
+            [event = SocketObserverInterface::PacketsWrittenEvent::Builder()
+                         .setOutstandingPackets(conn_->outstandings.packets)
+                         .setWriteCount(conn_->writeCount)
+                         .setLastPacketSentTime(
+                             conn_->lossState.maybeLastPacketSentTime)
+                         .setCwndInBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getCongestionWindow())
+                                 : folly::none)
+                         .setWritableBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getWritableBytes())
+                                 : folly::none)
+                         .setNumPacketsWritten(numPacketsWritten)
+                         .setNumAckElicitingPacketsWritten(
+                             numAckElicitingPacketsWritten)
+                         .setNumBytesWritten(numBytesWritten)
+                         .build()](auto observer, auto observed) {
+              observer->packetsWritten(observed, event);
+            });
   }
 }
 
 void QuicTransportBase::notifyAppRateLimited() {
-  const auto event = Observer::AppLimitedEvent::Builder()
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::appRateLimitedEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<
+            SocketObserverInterface::Events::appRateLimitedEvents>(
+            [event = SocketObserverInterface::AppLimitedEvent::Builder()
                          .setOutstandingPackets(conn_->outstandings.packets)
                          .setWriteCount(conn_->writeCount)
-                         .build();
-  for (const auto& cb : *observers_) {
-    if (cb->getConfig().appRateLimitedEvents) {
-      cb->appRateLimited(this, event);
-    }
+                         .setLastPacketSentTime(
+                             conn_->lossState.maybeLastPacketSentTime)
+                         .setCwndInBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getCongestionWindow())
+                                 : folly::none)
+                         .setWritableBytes(
+                             conn_->congestionController
+                                 ? folly::Optional<uint64_t>(
+                                       conn_->congestionController
+                                           ->getWritableBytes())
+                                 : folly::none)
+                         .build()](auto observer, auto observed) {
+              observer->appRateLimited(observed, event);
+            });
   }
 }
 

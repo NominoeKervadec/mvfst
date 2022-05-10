@@ -37,6 +37,24 @@ BbrCongestionController::BbrCongestionController(QuicConnectionStateBase& conn)
       pacingGainCycles_(kPacingGainCycles.begin(), kPacingGainCycles.end()),
       maxAckHeightFilter_(bandwidthWindowLength(kNumOfCycles), 0, 0) {}
 
+BbrCongestionController::BbrCongestionController(
+    QuicConnectionStateBase& conn,
+    uint64_t cwndBytes,
+    std::chrono::microseconds minRtt)
+    : conn_(conn),
+      cwnd_(cwndBytes),
+      initialCwnd_(
+          conn.udpSendPacketLen * conn.transportSettings.initCwndInMss),
+      recoveryWindow_(
+          conn.udpSendPacketLen * conn.transportSettings.maxCwndInMss),
+      pacingWindow_(cwndBytes),
+      pacingGainCycles_(kPacingGainCycles.begin(), kPacingGainCycles.end()),
+      maxAckHeightFilter_(bandwidthWindowLength(kNumOfCycles), 0, 0) {
+  if (conn_.pacer) {
+    conn_.pacer->refreshPacingRate(pacingWindow_, minRtt);
+  }
+}
+
 CongestionControlType BbrCongestionController::type() const noexcept {
   return CongestionControlType::BBR;
 }
@@ -110,6 +128,10 @@ void BbrCongestionController::onPacketSent(const OutstandingPacket& packet) {
 }
 
 uint64_t BbrCongestionController::updateAckAggregation(const AckEvent& ack) {
+  if (isExperimental_) {
+    // Experiment with disabling this ack aggregation logic
+    return 0;
+  }
   if (!ackAggregationStartTime_) {
     // Ideally one'd DCHECK/CHECK ackAggregationStartTime_ has some value, as we
     // can't possibly get an ack or loss without onPacketSent ever. However
@@ -153,7 +175,7 @@ void BbrCongestionController::onPacketAckOrLoss(
       conn_.pacer->onPacketsLoss();
     }
   }
-  if (ackEvent && ackEvent->largestAckedPacket.has_value()) {
+  if (ackEvent && ackEvent->largestNewlyAckedPacket.has_value()) {
     CHECK(!ackEvent->ackedPackets.empty());
     onPacketAcked(*ackEvent, prevInflightBytes, lossEvent != nullptr);
   }
@@ -179,17 +201,18 @@ void BbrCongestionController::onPacketAcked(
     updateCwnd(ack.ackedBytes, 0);
     return;
   }
-  if (ack.mrttSample && minRttSampler_) {
+  if (ack.rttSample && minRttSampler_) {
     bool updated =
-        minRttSampler_->newRttSample(ack.mrttSample.value(), ack.ackTime);
+        minRttSampler_->newRttSample(ack.rttSample.value(), ack.ackTime);
     if (updated) {
       appLimitedSinceProbeRtt_ = false;
     }
   }
 
-  bool newRoundTrip = updateRoundTripCounter(ack.largestAckedPacketSentTime);
+  bool newRoundTrip =
+      updateRoundTripCounter(ack.largestNewlyAckedPacketSentTime);
   bool lastAckedPacketAppLimited =
-      ack.ackedPackets.empty() ? false : ack.largestAckedPacketAppLimited;
+      ack.ackedPackets.empty() ? false : ack.largestNewlyAckedPacketAppLimited;
   if (bandwidthSampler_) {
     bandwidthSampler_->onPacketAcked(ack, roundTripCounter_);
   }
@@ -199,7 +222,7 @@ void BbrCongestionController::onPacketAcked(
         recoveryState_ != BbrCongestionController::RecoveryState::GROWTH) {
       recoveryState_ = BbrCongestionController::RecoveryState::GROWTH;
     }
-    if (ack.largestAckedPacketSentTime > *endOfRecovery_) {
+    if (ack.largestNewlyAckedPacketSentTime > *endOfRecovery_) {
       recoveryState_ = BbrCongestionController::RecoveryState::NOT_RECOVERY;
     } else {
       updateRecoveryWindowWithAck(ack.ackedBytes);
@@ -593,6 +616,10 @@ void BbrCongestionController::setBandwidthUtilizationFactor(
 
 bool BbrCongestionController::isInBackgroundMode() const noexcept {
   return bandwidthUtilizationFactor_ < 1.0;
+}
+
+void BbrCongestionController::setExperimental(bool experimental) {
+  isExperimental_ = experimental;
 }
 
 void BbrCongestionController::getStats(CongestionControllerStats& stats) const {

@@ -24,7 +24,7 @@ QuicServerTransport::QuicServerTransport(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> sock,
     ConnectionSetupCallback* connSetupCb,
-    ConnectionCallbackNew* connStreamsCb,
+    ConnectionCallback* connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     PacketNum startingPacketNum)
@@ -42,7 +42,7 @@ QuicServerTransport::QuicServerTransport(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> sock,
     ConnectionSetupCallback* connSetupCb,
-    ConnectionCallbackNew* connStreamsCb,
+    ConnectionCallback* connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     std::unique_ptr<CryptoFactory> cryptoFactory,
     bool useConnectionEndWithErrorCallback)
@@ -50,7 +50,8 @@ QuicServerTransport::QuicServerTransport(
           evb,
           std::move(sock),
           useConnectionEndWithErrorCallback),
-      ctx_(std::move(ctx)) {
+      ctx_(std::move(ctx)),
+      observerContainer_(std::make_shared<SocketObserverContainer>(this)) {
   auto tempConn = std::make_unique<QuicServerConnectionState>(
       FizzServerQuicHandshakeContext::Builder()
           .setFizzServerContext(ctx_)
@@ -59,10 +60,10 @@ QuicServerTransport::QuicServerTransport(
   tempConn->serverAddr = socket_->address();
   serverConn_ = tempConn.get();
   conn_.reset(tempConn.release());
-  conn_->observers = observers_;
+  conn_->observerContainer = observerContainer_;
 
   setConnectionSetupCallback(connSetupCb);
-  setConnectionCallbackNew(connStreamsCb);
+  setConnectionCallback(connStreamsCb);
   registerAllTransportKnobParamHandlers();
 }
 
@@ -82,7 +83,7 @@ QuicServerTransport::Ptr QuicServerTransport::make(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> sock,
     ConnectionSetupCallback* connSetupCb,
-    ConnectionCallbackNew* connStreamsCb,
+    ConnectionCallback* connStreamsCb,
     std::shared_ptr<const fizz::server::FizzServerContext> ctx,
     bool useConnectionEndWithErrorCallback) {
   return std::make_shared<QuicServerTransport>(
@@ -145,6 +146,9 @@ void QuicServerTransport::onReadData(
   readData.peer = peer;
   readData.networkData = std::move(networkData);
   bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
+  uint64_t prevWritableBytes = serverConn_->writableBytesLimit
+      ? *serverConn_->writableBytesLimit
+      : std::numeric_limits<uint64_t>::max();
   onServerReadData(*serverConn_, readData);
   processPendingData(true);
 
@@ -162,6 +166,20 @@ void QuicServerTransport::onReadData(
       hasReceivedPackets(*conn_)) {
     connSetupCallback_->onFirstPeerPacketProcessed();
   }
+
+  uint64_t curWritableBytes = serverConn_->writableBytesLimit
+      ? *serverConn_->writableBytesLimit
+      : std::numeric_limits<uint64_t>::max();
+
+  // If we've increased our writable bytes limit after processing incoming data
+  // and we were previously blocked from writing probes, fire the PTO alarm
+  if (serverConn_->transportSettings.enableWritableBytesLimit &&
+      serverConn_->numProbesWritableBytesLimited &&
+      prevWritableBytes < curWritableBytes) {
+    onPTOAlarm(*serverConn_);
+    serverConn_->numProbesWritableBytesLimited = 0;
+  }
+
   maybeWriteNewSessionTicket();
   maybeNotifyConnectionIdBound();
   maybeNotifyHandshakeFinished();
@@ -544,10 +562,15 @@ void QuicServerTransport::maybeNotifyConnectionIdBound() {
 }
 
 void QuicServerTransport::maybeNotifyHandshakeFinished() {
-  if (handshakeFinishedCb_ &&
-      serverConn_->serverHandshakeLayer->isHandshakeDone()) {
-    handshakeFinishedCb_->onHandshakeFinished();
-    handshakeFinishedCb_ = nullptr;
+  if (serverConn_->serverHandshakeLayer->isHandshakeDone()) {
+    if (handshakeFinishedCb_) {
+      handshakeFinishedCb_->onHandshakeFinished();
+      handshakeFinishedCb_ = nullptr;
+    }
+    if (connSetupCallback_ && !handshakeDoneNotified_) {
+      connSetupCallback_->onFullHandshakeDone();
+      handshakeDoneNotified_ = true;
+    }
   }
 }
 
@@ -560,8 +583,7 @@ void QuicServerTransport::maybeIssueConnectionIds() {
     // If the peer specifies that they have a limit of 1,000,000 connection
     // ids then only issue a small number at first, since the server still
     // needs to be able to search through all issued ids for routing.
-    const uint64_t maximumIdsToIssue = std::min(
-        conn_->peerActiveConnectionIdLimit, kDefaultActiveConnectionIdLimit);
+    const uint64_t maximumIdsToIssue = maximumConnectionIdsToIssue(*conn_);
 
     // Make sure size of selfConnectionIds is not larger than maximumIdsToIssue
     for (size_t i = conn_->selfConnectionIds.size(); i < maximumIdsToIssue;
@@ -620,10 +642,16 @@ void QuicServerTransport::maybeStartD6DProbing() {
     // valuable
     conn_->pendingEvents.d6d.sendProbeDelay = kDefaultD6DKickStartDelay;
     QUIC_STATS(conn_->statsCallback, onConnectionD6DStarted);
-    for (const auto& cb : *(conn_->observers)) {
-      if (cb->getConfig().pmtuEvents) {
-        cb->pmtuProbingStarted(this);
-      }
+
+    if (getSocketObserverContainer() &&
+        getSocketObserverContainer()
+            ->hasObserversForEvent<
+                SocketObserverInterface::Events::pmtuEvents>()) {
+      getSocketObserverContainer()
+          ->invokeInterfaceMethod<SocketObserverInterface::Events::pmtuEvents>(
+              [](auto observer, auto observed) {
+                observer->pmtuProbingStarted(observed);
+              });
     }
   }
 }
@@ -668,6 +696,13 @@ void QuicServerTransport::onTransportKnobs(Buf knobBlob) {
           onTransportKnobError,
           TransportKnobParamId::UNKNOWN);
     }
+  }
+}
+
+void QuicServerTransport::verifiedClientAddress() {
+  if (serverConn_) {
+    serverConn_->isClientAddrVerified = true;
+    conn_->writableBytesLimit = folly::none;
   }
 }
 
@@ -859,6 +894,25 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
               enableExperimental);
         }
       });
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::KEEPALIVE_ENABLED),
+      [](QuicServerTransport* serverTransport, uint64_t val) {
+        CHECK(serverTransport);
+        auto server_conn = serverTransport->serverConn_;
+        server_conn->transportSettings.enableKeepalive = static_cast<bool>(val);
+        VLOG(3) << "KEEPALIVE_ENABLED KnobParam received: "
+                << static_cast<bool>(val);
+      });
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::REMOVE_FROM_LOSS_BUFFER),
+      [](QuicServerTransport* serverTransport, uint64_t val) {
+        CHECK(serverTransport);
+        auto server_conn = serverTransport->serverConn_;
+        server_conn->transportSettings.removeFromLossBufferOnSpurious =
+            static_cast<bool>(val);
+        VLOG(3) << "REMOVE_FROM_LOSS_BUFFER KnobParam received: "
+                << static_cast<bool>(val);
+      });
 }
 
 QuicConnectionStats QuicServerTransport::getConnectionsStats() const {
@@ -867,6 +921,13 @@ QuicConnectionStats QuicServerTransport::getConnectionsStats() const {
     connStats.localAddress = serverConn_->serverAddr;
   }
   return connStats;
+}
+
+CipherInfo QuicServerTransport::getOneRttCipherInfo() const {
+  return {
+      *conn_->oneRttWriteCipher->getKey(),
+      *serverConn_->serverHandshakeLayer->getState().cipher(),
+      conn_->oneRttWriteHeaderCipher->getKey()->clone()};
 }
 
 } // namespace quic

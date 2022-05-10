@@ -22,8 +22,8 @@ namespace {
  */
 struct OutstandingPacketWithHandlerContext {
   explicit OutstandingPacketWithHandlerContext(
-      OutstandingPacket&& outstandingPacketIn)
-      : outstandingPacket(outstandingPacketIn) {}
+      OutstandingPacket outstandingPacketIn)
+      : outstandingPacket(std::move(outstandingPacketIn)) {}
 
   OutstandingPacket outstandingPacket;
   bool processAllFrames{false};
@@ -60,21 +60,26 @@ AckEvent processAckFrame(
   auto ack = AckEvent::Builder()
                  .setAckTime(ackReceiveTime)
                  .setAdjustedAckTime(ackReceiveTime - frame.ackDelay)
+                 .setAckDelay(frame.ackDelay)
                  .setPacketNumberSpace(pnSpace)
+                 .setLargestAckedPacket(frame.largestAcked)
                  .setIsImplicitAck(frame.implicit)
                  .build();
 
   // temporary storage to enable packets to be processed in sent order
-  std::deque<OutstandingPacketWithHandlerContext> packetsWithHandlerContext;
+  SmallVec<OutstandingPacketWithHandlerContext, 50, uint16_t>
+      packetsWithHandlerContext;
 
   auto currentPacketIt = getLastOutstandingPacketIncludingLost(conn, pnSpace);
   uint64_t dsrPacketsAcked = 0;
   folly::Optional<decltype(conn.lossState.lastAckedPacketSentTime)>
       lastAckedPacketSentTime;
-  folly::Optional<Observer::SpuriousLossEvent> spuriousLossEvent;
+  folly::Optional<LegacyObserver::SpuriousLossEvent> spuriousLossEvent;
   // Used for debug only.
   const auto originalPacketCount = conn.outstandings.packetCount;
-  if (conn.observers->size() > 0) {
+  if (conn.observerContainer &&
+      conn.observerContainer->hasObserversForEvent<
+          SocketObserverInterface::Events::spuriousLossEvents>()) {
     spuriousLossEvent.emplace(ackReceiveTime);
   }
   auto ackBlockIt = frame.ackBlocks.cbegin();
@@ -133,7 +138,6 @@ AckEvent processAckFrame(
                << conn;
       // If we hit a packet which has been lost we need to count the spurious
       // loss and ignore all other processing.
-      // TODO also remove any stream data from the loss buffer.
       if (rPacketIt->declaredLost) {
         CHECK_GT(conn.outstandings.declaredLostCount, 0);
         conn.lossState.totalPacketsSpuriouslyMarkedLost++;
@@ -151,9 +155,25 @@ AckEvent processAckFrame(
                 rPacketIt->lossTimeoutDividend.value();
           }
         }
+        if (conn.transportSettings.removeFromLossBufferOnSpurious) {
+          for (auto& f : rPacketIt->packet.frames) {
+            auto streamFrame = f.asWriteStreamFrame();
+            if (streamFrame) {
+              auto stream =
+                  conn.streamManager->findStream(streamFrame->streamId);
+              if (stream) {
+                stream->removeFromLossBuffer(
+                    streamFrame->offset, streamFrame->len, streamFrame->fin);
+                conn.streamManager->updateLossStreams(*stream);
+                conn.streamManager->updateWritableStreams(*stream);
+              }
+            }
+          }
+        }
         QUIC_STATS(conn.statsCallback, onPacketSpuriousLoss);
         // Decrement the counter, trust that we will erase this as part of
         // the bulk erase.
+        CHECK_GT(conn.outstandings.declaredLostCount, 0);
         conn.outstandings.declaredLostCount--;
         if (spuriousLossEvent) {
           spuriousLossEvent->addSpuriousPacket(*rPacketIt);
@@ -196,20 +216,29 @@ AckEvent processAckFrame(
             ackReceiveTimeOrNow - rPacketIt->metadata.time);
         if (rttSample != rttSample.zero()) {
           // notify observers
-          Observer::PacketRTT packetRTT(
-              ackReceiveTimeOrNow, rttSample, frame.ackDelay, *rPacketIt);
-          for (const auto& observer : *(conn.observers)) {
-            conn.pendingCallbacks.emplace_back(
-                [observer, packetRTT](QuicSocket* qSocket) {
-                  if (observer->getConfig().rttSamples) {
-                    observer->rttSampleGenerated(qSocket, packetRTT);
-                  }
+          if (conn.observerContainer &&
+              conn.observerContainer->hasObserversForEvent<
+                  SocketObserverInterface::Events::rttSamples>()) {
+            conn.observerContainer->invokeInterfaceMethod<
+                SocketObserverInterface::Events::rttSamples>(
+                [event = SocketObserverInterface::PacketRTT(
+                     ackReceiveTimeOrNow,
+                     rttSample,
+                     frame.ackDelay,
+                     *rPacketIt)](auto observer, auto observed) {
+                  observer->rttSampleGenerated(observed, event);
                 });
           }
 
-          // update AckEvent RTTs, which are used by CCA and other procesisng
-          ack.mrttSample =
-              std::min(ack.mrttSample.value_or(rttSample), rttSample);
+          // update AckEvent RTTs, which are used by CCA and other processing
+          CHECK(!ack.rttSample.has_value());
+          CHECK(!ack.rttSampleNoAckDelay.has_value());
+          ack.rttSample = rttSample;
+          ack.rttSampleNoAckDelay = (rttSample >= frame.ackDelay)
+              ? folly::make_optional(
+                    std::chrono::ceil<std::chrono::microseconds>(
+                        rttSample - frame.ackDelay))
+              : folly::none;
 
           // update transport RTT
           updateRtt(conn, rttSample, frame.ackDelay);
@@ -231,11 +260,11 @@ AckEvent processAckFrame(
       if (rPacketIt->associatedEvent) {
         conn.outstandings.packetEvents.erase(*rPacketIt->associatedEvent);
       }
-      if (!ack.largestAckedPacket ||
-          *ack.largestAckedPacket < currentPacketNum) {
-        ack.largestAckedPacket = currentPacketNum;
-        ack.largestAckedPacketSentTime = rPacketIt->metadata.time;
-        ack.largestAckedPacketAppLimited = rPacketIt->isAppLimited;
+      if (!ack.largestNewlyAckedPacket ||
+          *ack.largestNewlyAckedPacket < currentPacketNum) {
+        ack.largestNewlyAckedPacket = currentPacketNum;
+        ack.largestNewlyAckedPacketSentTime = rPacketIt->metadata.time;
+        ack.largestNewlyAckedPacketAppLimited = rPacketIt->isAppLimited;
       }
       if (!ack.implicit) {
         conn.lossState.totalBytesAcked += rPacketIt->metadata.encodedSize;
@@ -251,16 +280,16 @@ AckEvent processAckFrame(
         conn.lossState.adjustedLastAckedTime = ackReceiveTime - frame.ackDelay;
       }
 
-      // temporarily store the packet to facilitate in-order ACK processing
       {
         auto tmpIt = packetsWithHandlerContext.emplace(
             std::find_if(
-                packetsWithHandlerContext.begin(),
-                packetsWithHandlerContext.end(),
+                packetsWithHandlerContext.rbegin(),
+                packetsWithHandlerContext.rend(),
                 [&currentPacketNum](const auto& packetWithHandlerContext) {
                   return packetWithHandlerContext.outstandingPacket.packet
                              .header.getPacketSequenceNum() > currentPacketNum;
-                }),
+                })
+                .base(),
             std::move(*rPacketIt));
         tmpIt->processAllFrames = needsProcess;
       }
@@ -285,9 +314,11 @@ AckEvent processAckFrame(
   // frame types only if the packet doesn't have an associated PacketEvent;
   // or the PacketEvent is in conn.outstandings.packetEvents
   ack.ackedPackets.reserve(packetsWithHandlerContext.size());
-  for (auto& packetWithHandlerContext : packetsWithHandlerContext) {
-    auto& outstandingPacket = packetWithHandlerContext.outstandingPacket;
-    const auto processAllFrames = packetWithHandlerContext.processAllFrames;
+  for (auto packetWithHandlerContextItr = packetsWithHandlerContext.rbegin();
+       packetWithHandlerContextItr != packetsWithHandlerContext.rend();
+       packetWithHandlerContextItr++) {
+    auto& outstandingPacket = packetWithHandlerContextItr->outstandingPacket;
+    const auto processAllFrames = packetWithHandlerContextItr->processAllFrames;
     AckEvent::AckPacket::DetailsPerStream detailsPerStream;
     for (auto& packetFrame : outstandingPacket.packet.frames) {
       if (!processAllFrames &&
@@ -431,7 +462,7 @@ AckEvent processAckFrame(
   CHECK_GE(updatedOustandingPacketsCount, conn.outstandings.numClonedPackets());
   auto lossEvent = handleAckForLoss(conn, lossVisitor, ack, pnSpace);
   if (conn.congestionController &&
-      (ack.largestAckedPacket.has_value() || lossEvent)) {
+      (ack.largestNewlyAckedPacket.has_value() || lossEvent)) {
     if (lossEvent) {
       CHECK(lossEvent->largestLostSentTime && lossEvent->smallestLostSentTime);
       // TODO it's not clear that we should be using the smallest and largest
@@ -450,18 +481,20 @@ AckEvent processAckFrame(
       }
     }
     conn.congestionController->onPacketAckOrLoss(&ack, lossEvent.get_pointer());
+    ack.ccState = conn.congestionController->getState();
   }
   clearOldOutstandingPackets(conn, ackReceiveTime, pnSpace);
-  if (spuriousLossEvent && spuriousLossEvent->hasPackets()) {
-    for (const auto& observer : *(conn.observers)) {
-      conn.pendingCallbacks.emplace_back(
-          [observer, spuriousLossEvent](QuicSocket* qSocket) {
-            if (observer->getConfig().spuriousLossEvents) {
-              observer->spuriousLossDetected(qSocket, *spuriousLossEvent);
-            }
-          });
-    }
+
+  if (spuriousLossEvent && conn.observerContainer &&
+      conn.observerContainer->hasObserversForEvent<
+          SocketObserverInterface::Events::spuriousLossEvents>()) {
+    conn.observerContainer->invokeInterfaceMethod<
+        SocketObserverInterface::Events::spuriousLossEvents>(
+        [spuriousLossEvent](auto observer, auto observed) {
+          observer->spuriousLossDetected(observed, *spuriousLossEvent);
+        });
   }
+
   return ack;
 }
 
@@ -492,6 +525,7 @@ void clearOldOutstandingPackets(
       auto timeSinceSent = time - opItr->metadata.time;
       if (opItr->declaredLost && timeSinceSent > threshold) {
         opItr++;
+        CHECK_GT(conn.outstandings.declaredLostCount, 0);
         conn.outstandings.declaredLostCount--;
       } else {
         break;

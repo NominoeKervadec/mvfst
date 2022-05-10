@@ -92,6 +92,36 @@ bool toWriteAppDataAcks(const quic::QuicConnectionStateBase& conn) {
 
 using namespace quic;
 
+/**
+ * This function returns the number of write bytes that are available until we
+ * reach the writableBytesLimit. It may or may not be the limiting factor on the
+ * number of bytes we can write on the wire.
+ *
+ * If the client's address has not been verified, this will return the number of
+ * write bytes available until writableBytesLimit is reached.
+ *
+ * Otherwise if the client's address is validated, it will return unlimited
+ * number of bytes to write.
+ */
+uint64_t maybeUnvalidatedClientWritableBytes(
+    quic::QuicConnectionStateBase& conn) {
+  if (!conn.writableBytesLimit) {
+    return unlimitedWritableBytes(conn);
+  }
+
+  if (*conn.writableBytesLimit <= conn.lossState.totalBytesSent) {
+    QUIC_STATS(conn.statsCallback, onConnectionWritableBytesLimited);
+    return 0;
+  }
+
+  uint64_t writableBytes =
+      *conn.writableBytesLimit - conn.lossState.totalBytesSent;
+
+  // round the result up to the nearest multiple of udpSendPacketLen.
+  return (writableBytes + conn.udpSendPacketLen - 1) / conn.udpSendPacketLen *
+      conn.udpSendPacketLen;
+}
+
 WriteQuicDataResult writeQuicDataToSocketImpl(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
@@ -326,8 +356,8 @@ DataPathResult iobufChainBasedBuildScheduleEncrypt(
   packet->header->coalesce();
   auto headerLen = packet->header->length();
   auto bodyLen = packet->body->computeChainDataLength();
-  auto unencrypted =
-      folly::IOBuf::create(headerLen + bodyLen + aead.getCipherOverhead());
+  auto unencrypted = folly::IOBuf::createCombined(
+      headerLen + bodyLen + aead.getCipherOverhead());
   auto bodyCursor = folly::io::Cursor(packet->body.get());
   bodyCursor.pull(unencrypted->writableData() + headerLen, bodyLen);
   unencrypted->advance(headerLen);
@@ -812,6 +842,7 @@ void updateConnection(
   if (!conn.pendingEvents.setLossDetectionAlarm) {
     conn.pendingEvents.setLossDetectionAlarm = retransmittable;
   }
+  conn.lossState.maybeLastPacketSentTime = sentTime;
   conn.lossState.totalBytesSent += encodedSize;
   conn.lossState.totalBodyBytesSent += encodedBodySize;
   conn.lossState.totalPacketsSent++;
@@ -876,6 +907,7 @@ void updateConnection(
   pkt.isDSRPacket = isDSRPacket;
   if (isDSRPacket) {
     ++conn.outstandings.dsrCount;
+    QUIC_STATS(conn.statsCallback, onDSRPacketSent, encodedSize);
   }
 
   if (conn.congestionController) {
@@ -897,7 +929,15 @@ void updateConnection(
   }
 }
 
-uint64_t congestionControlWritableBytes(const QuicConnectionStateBase& conn) {
+uint64_t probePacketWritableBytes(QuicConnectionStateBase& conn) {
+  uint64_t probeWritableBytes = maybeUnvalidatedClientWritableBytes(conn);
+  if (!probeWritableBytes) {
+    conn.numProbesWritableBytesLimited++;
+  }
+  return probeWritableBytes;
+}
+
+uint64_t congestionControlWritableBytes(QuicConnectionStateBase& conn) {
   uint64_t writableBytes = std::numeric_limits<uint64_t>::max();
 
   if (conn.pendingEvents.pathChallenge || conn.outstandingPathValidation) {
@@ -912,10 +952,7 @@ uint64_t congestionControlWritableBytes(const QuicConnectionStateBase& conn) {
         std::chrono::steady_clock::now(),
         conn.lossState.srtt == 0us ? kDefaultInitialRtt : conn.lossState.srtt);
   } else if (conn.writableBytesLimit) {
-    if (*conn.writableBytesLimit <= conn.lossState.totalBytesSent) {
-      return 0;
-    }
-    writableBytes = *conn.writableBytesLimit - conn.lossState.totalBytesSent;
+    writableBytes = maybeUnvalidatedClientWritableBytes(conn);
   }
 
   if (conn.congestionController) {
@@ -933,7 +970,7 @@ uint64_t congestionControlWritableBytes(const QuicConnectionStateBase& conn) {
       conn.udpSendPacketLen;
 }
 
-uint64_t unlimitedWritableBytes(const QuicConnectionStateBase&) {
+uint64_t unlimitedWritableBytes(QuicConnectionStateBase&) {
   return std::numeric_limits<uint64_t>::max();
 }
 
@@ -1458,6 +1495,7 @@ uint64_t writeProbingDataToSocket(
   CloningScheduler cloningScheduler(
       scheduler, connection, "CloningScheduler", aead.getCipherOverhead());
   auto writeLoopBeginTime = Clock::now();
+
   auto written = writeConnectionDataToSocket(
                      sock,
                      connection,
@@ -1466,7 +1504,9 @@ uint64_t writeProbingDataToSocket(
                      builder,
                      pnSpace,
                      cloningScheduler,
-                     unlimitedWritableBytes,
+                     connection.transportSettings.enableWritableBytesLimit
+                         ? probePacketWritableBytes
+                         : unlimitedWritableBytes,
                      probesToSend,
                      aead,
                      headerCipher,
@@ -1490,7 +1530,9 @@ uint64_t writeProbingDataToSocket(
                    builder,
                    pnSpace,
                    pingScheduler,
-                   unlimitedWritableBytes,
+                   connection.transportSettings.enableWritableBytesLimit
+                       ? probePacketWritableBytes
+                       : unlimitedWritableBytes,
                    probesToSend - written,
                    aead,
                    headerCipher,
@@ -1549,7 +1591,7 @@ uint64_t writeD6DProbeToSocket(
   return written;
 }
 
-WriteDataReason shouldWriteData(const QuicConnectionStateBase& conn) {
+WriteDataReason shouldWriteData(/*const*/ QuicConnectionStateBase& conn) {
   auto& numProbePackets = conn.pendingEvents.numProbePackets;
   bool shouldWriteInitialProbes =
       numProbePackets[PacketNumberSpace::Initial] && conn.initialWriteCipher;

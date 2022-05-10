@@ -134,6 +134,10 @@ struct QuicServerConnectionState : public QuicConnectionStateBase {
   // Number of bytes the server has written during the handshake.
   uint64_t numHandshakeBytesSent{0};
 
+  // Whether or not the client has verified their address (thru CFIN or
+  // NewToken).
+  bool isClientAddrVerified{false};
+
 #ifdef CCP_ENABLED
   // Pointer to struct that maintains state needed for interacting with libccp.
   // Once instance of this struct is created for each instance of
@@ -157,6 +161,8 @@ struct QuicServerConnectionState : public QuicConnectionStateBase {
     supportedVersions = std::vector<QuicVersion>{
         {QuicVersion::MVFST,
          QuicVersion::MVFST_EXPERIMENTAL,
+         QuicVersion::MVFST_EXPERIMENTAL2,
+         QuicVersion::MVFST_EXPERIMENTAL3,
          QuicVersion::MVFST_ALIAS,
          QuicVersion::QUIC_V1,
          QuicVersion::QUIC_DRAFT}};
