@@ -8,6 +8,7 @@
 #include <quic/server/test/QuicServerTransportTestUtil.h>
 
 #include <quic/codec/QuicPacketBuilder.h>
+#include <quic/common/TransportKnobs.h>
 #include <quic/dsr/Types.h>
 #include <quic/dsr/test/Mocks.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
@@ -26,6 +27,7 @@ namespace test {
 namespace {
 using ByteEvent = QuicTransportBase::ByteEvent;
 using PacketDropReason = QuicTransportStatsCallback::PacketDropReason;
+auto constexpr kTestMaxPacingRate = std::numeric_limits<uint64_t>::max();
 } // namespace
 
 folly::Optional<QuicFrame> getFrameIfPresent(
@@ -1333,6 +1335,103 @@ TEST_F(QuicServerTransportTest, ReceiveConnectionClose) {
   checkTransportStateUpdate(qLogger, std::move(closedMsg));
 }
 
+TEST_F(QuicServerTransportTest, ReceiveConnectionCloseBeforeDatagram) {
+  auto& conn = server->getNonConstConn();
+  conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
+  conn.datagramState.maxReadBufferSize = 10;
+
+  auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Server);
+  server->getNonConstConn().qLogger = qLogger;
+
+  {
+    // Deliver a datagram.
+    // Should be received just fine.
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero,
+        *server->getConn().serverConnectionId,
+        clientNextAppDataPacketNum++);
+    RegularQuicPacketBuilder builder(
+        server->getConn().udpSendPacketLen,
+        std::move(header),
+        0 /* largestAcked */);
+    builder.encodePacketHeader();
+    StringPiece datagramPayload = "do not rely on me. I am unreliable";
+    DatagramFrame datagramFrame(
+        datagramPayload.size(), IOBuf::copyBuffer(datagramPayload));
+    writeFrame(datagramFrame, builder);
+    auto packet = std::move(builder).buildPacket();
+
+    EXPECT_CALL(*quicStats_, onDatagramRead(_)).Times(1);
+    deliverDataWithoutErrorCheck(packetToBuf(packet));
+    ASSERT_EQ(server->getConn().datagramState.readBuffer.size(), 1);
+  }
+
+  auto lateDgPktNum = clientNextAppDataPacketNum++;
+  auto connClosePktNum = clientNextAppDataPacketNum++;
+
+  {
+    // Deliver conn close followed by another datagram.
+    // Conn should close and clean up, the late datagram should be ignored and
+    // dropped on the floor.
+
+    // Build conn close frame.
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero,
+        *server->getConn().serverConnectionId,
+        connClosePktNum);
+    RegularQuicPacketBuilder builder(
+        server->getConn().udpSendPacketLen,
+        std::move(header),
+        0 /* largestAcked */);
+    builder.encodePacketHeader();
+    std::string errMsg = "Stand clear of the closing doors, please";
+    ConnectionCloseFrame connClose(
+        QuicErrorCode(TransportErrorCode::NO_ERROR), errMsg);
+    writeFrame(std::move(connClose), builder);
+    auto packet = std::move(builder).buildPacket();
+
+    // Build late datagram.
+    ShortHeader header2(
+        ProtectionType::KeyPhaseZero,
+        *server->getConn().serverConnectionId,
+        lateDgPktNum);
+    RegularQuicPacketBuilder builder2(
+        server->getConn().udpSendPacketLen,
+        std::move(header2),
+        0 /* largestAcked */);
+    builder2.encodePacketHeader();
+    StringPiece datagramPayload = "do not rely on me. I am unreliable";
+    DatagramFrame datagramFrame(
+        datagramPayload.size(), IOBuf::copyBuffer(datagramPayload));
+    writeFrame(datagramFrame, builder2);
+    auto packet2 = std::move(builder2).buildPacket();
+
+    // Deliver conn close followed by late datagram.
+    EXPECT_CALL(*quicStats_, onDatagramRead(_)).Times(0);
+    EXPECT_CALL(connCallback, onConnectionEnd()).Times(1);
+    deliverDataWithoutErrorCheck(packetToBuf(packet));
+    deliverDataWithoutErrorCheck(packetToBuf(packet2));
+
+    // Now the transport should be closed
+    EXPECT_EQ(
+        server->getConn().localConnectionError->code,
+        QuicErrorCode(TransportErrorCode::NO_ERROR));
+    EXPECT_EQ(
+        server->getConn().peerConnectionError->code,
+        QuicErrorCode(TransportErrorCode::NO_ERROR));
+    auto closedMsg =
+        folly::to<std::string>("Server closed by peer reason=", errMsg);
+    EXPECT_EQ(server->getConn().peerConnectionError->message, closedMsg);
+    EXPECT_TRUE(server->isClosed());
+    EXPECT_TRUE(verifyFramePresent(
+        serverWrites,
+        *makeClientEncryptedCodec(),
+        QuicFrame::Type::ConnectionCloseFrame));
+    ASSERT_EQ(server->getConn().datagramState.readBuffer.size(), 0);
+    checkTransportStateUpdate(qLogger, std::move(closedMsg));
+  }
+}
+
 TEST_F(QuicServerTransportTest, ReceiveApplicationClose) {
   auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Server);
   server->getNonConstConn().qLogger = qLogger;
@@ -1510,7 +1609,7 @@ TEST_F(QuicServerTransportTest, CongestionControlAggressivenessKnob) {
 
   // Set to background mode will no have an effect. It only works on BBR.
   server->handleKnobParams({
-      {52395, 75},
+      {52395, uint64_t{75}},
   });
 
   // Switch to BBR congestion control
@@ -1524,14 +1623,14 @@ TEST_F(QuicServerTransportTest, CongestionControlAggressivenessKnob) {
 
   // Set to background mode.
   server->handleKnobParams({
-      {52395, 75},
+      {52395, uint64_t{75}},
   });
   // BBR should now be in background mode
   EXPECT_TRUE(cc->isInBackgroundMode());
 
   // Turn off background mode and verify it
   server->handleKnobParams({
-      {52395, 100},
+      {52395, uint64_t{100}},
   });
   EXPECT_FALSE(cc->isInBackgroundMode());
 }
@@ -3314,6 +3413,37 @@ TEST_F(
 
 TEST_F(
     QuicUnencryptedServerTransportTest,
+    TestHandshakeWritableBytesLimitedWithCFinNewToken) {
+  /**
+   * Exact same test case as above, but let's make the transport assume that the
+   * address was verified (we received a valid new token). This should bypass
+   * the writableBytesLimit and proceed as usual.
+   */
+  EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited())
+      .Times(AtLeast(0));
+  /**
+   * Set the WritableBytes limit to 3x (~ 3 * 1200 = 3,600). This will not be
+   * enough for the handshake to fit (1200 initial + 4000 handshake = 5,200 >
+   * 3,600), however the valid new token should bypass the limit and not be
+   * blocked.
+   */
+  auto transportSettings = server->getTransportSettings();
+  transportSettings.limitedCwndInMss = 3;
+  transportSettings.enableWritableBytesLimit = true;
+  server->setTransportSettings(transportSettings);
+
+  // make the server think we've received a valid new token
+  server->verifiedClientAddress();
+
+  recvClientHello(true, QuicVersion::MVFST, "CHLO_CERT");
+
+  EXPECT_GE(serverWrites.size(), 3);
+
+  AckStates ackStates;
+}
+
+TEST_F(
+    QuicUnencryptedServerTransportTest,
     TestHandshakeWritableBytesLimitedWithCFin) {
   EXPECT_CALL(*quicStats_, onConnectionWritableBytesLimited())
       .Times(AtLeast(1));
@@ -4231,40 +4361,58 @@ TEST_F(QuicUnencryptedServerTransportTest, DuplicateOneRttWriteCipher) {
 TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
   int flag = 0;
   server->registerKnobParamHandler(
-      199, [&](QuicServerTransport* /* server_conn */, uint64_t val) {
-        EXPECT_EQ(val, 10);
+      199,
+      [&](QuicServerTransport* /* server_conn */, TransportKnobParam::Val val) {
+        EXPECT_EQ(std::get<uint64_t>(val), 10);
         flag = 1;
       });
   server->registerKnobParamHandler(
-      200, [&](QuicServerTransport* /* server_conn */, uint64_t /* val */) {
-        flag = 2;
-      });
+      200,
+      [&](QuicServerTransport* /* server_conn */,
+          const TransportKnobParam::Val& /* val */) { flag = 2; });
   server->handleKnobParams({
-      {199, 10},
-      {201, 20},
+      {199, uint64_t{10}},
+      {201, uint64_t{20}},
   });
 
   EXPECT_EQ(flag, 1);
 
   // ovewrite will fail, the new handler won't be called
   server->registerKnobParamHandler(
-      199, [&](QuicServerTransport* /* server_conn */, uint64_t val) {
-        EXPECT_EQ(val, 30);
+      199,
+      [&](QuicServerTransport* /* server_conn */, TransportKnobParam::Val val) {
+        EXPECT_EQ(std::get<uint64_t>(val), 30);
         flag = 3;
       });
 
   server->handleKnobParams({
-      {199, 10},
-      {201, 20},
+      {199, uint64_t{10}},
+      {201, uint64_t{20}},
   });
   EXPECT_EQ(flag, 1);
+}
+
+TEST_F(
+    QuicServerTransportTest,
+    TestHandleTransportKnobParamWithUnexpectedValTypes) {
+  // expect an uint64_t but string value provided
+  auto knobParamId =
+      static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB);
+  EXPECT_CALL(*quicStats_, onTransportKnobError(Eq(knobParamId))).Times(1);
+  server->handleKnobParams({{knobParamId, "not-uint64_t"}});
+
+  // expect a string but uint64_t value provided
+  knobParamId = static_cast<uint64_t>(
+      TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED);
+  EXPECT_CALL(*quicStats_, onTransportKnobError(Eq(knobParamId))).Times(1);
+  server->handleKnobParams({{knobParamId, uint64_t{1234}}});
 }
 
 TEST_F(QuicServerTransportTest, TestRegisterPMTUZeroBlackholeDetection) {
   server->handleKnobParams(
       {{static_cast<uint64_t>(
             TransportKnobParamId::ZERO_PMTU_BLACKHOLE_DETECTION),
-        1}});
+        uint64_t{1}}});
   EXPECT_TRUE(server->getConn().d6d.noBlackholeDetection);
 }
 
@@ -4277,13 +4425,16 @@ TEST_F(QuicServerTransportTest, TestCCExperimentalKnobHandler) {
 
   EXPECT_CALL(*rawCongestionController, setExperimental(true)).Times(2);
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL), 1}});
+      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
+        uint64_t{1}}});
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL), 2}});
+      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
+        uint64_t{2}}});
 
   EXPECT_CALL(*rawCongestionController, setExperimental(false)).Times(1);
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL), 0}});
+      {{static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
+        uint64_t{0}}});
 }
 
 TEST_F(QuicServerTransportTest, TestPacerExperimentalKnobHandler) {
@@ -4293,13 +4444,267 @@ TEST_F(QuicServerTransportTest, TestPacerExperimentalKnobHandler) {
 
   EXPECT_CALL(*rawPacer, setExperimental(true)).Times(2);
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL), 1}});
+      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
+        uint64_t{1}}});
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL), 2}});
+      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
+        uint64_t{2}}});
 
   EXPECT_CALL(*rawPacer, setExperimental(false)).Times(1);
   server->handleKnobParams(
-      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL), 0}});
+      {{static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
+        uint64_t{0}}});
+}
+
+TEST_F(QuicServerTransportTest, TestSetMaxPacingRateLifecycle) {
+  auto mockPacer = std::make_unique<NiceMock<MockPacer>>();
+  auto rawPacer = mockPacer.get();
+  server->getNonConstConn().pacer = std::move(mockPacer);
+
+  // verify init state NO_PACING
+  auto maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(kTestMaxPacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // set max pacing rate
+  uint64_t pacingRate = 1234;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(pacingRate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        pacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(pacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // disable pacing
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(kTestMaxPacingRate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        kTestMaxPacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(kTestMaxPacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // set max pacing rate again
+  pacingRate = 5678;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(pacingRate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        pacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(pacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // another pacing rate should still work
+  pacingRate = 9999;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(pacingRate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        pacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(pacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // disable pacing
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(kTestMaxPacingRate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        kTestMaxPacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(kTestMaxPacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+}
+
+TEST_F(
+    QuicServerTransportTest,
+    TestMaxPacingRateKnobSequencedWithInvalidFrameValues) {
+  auto mockPacer = std::make_unique<NiceMock<MockPacer>>();
+  auto rawPacer = mockPacer.get();
+  server->getNonConstConn().pacer = std::move(mockPacer);
+
+  // expect pacer never gets called
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(_)).Times(0);
+
+  // only pacing provided
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "1234"}});
+
+  // extra field beside pacing rate & sequence number
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "1234,5678,9999"}});
+
+  // non uint64_t provided as pacing rate
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "abc,1"}});
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "2a,1"}});
+
+  // non uint64_t provided as sequence number
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "1234,def"}});
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "1234,2a"}});
+
+  // negative integer provided
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "-1000,1"}});
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        "1000,-2"}});
+
+  // now, expect pacer to get called as we pass valid params
+  uint64_t rate = 1000;
+  uint64_t seqNum = 1;
+  auto knobVal = [&rate, &seqNum]() {
+    return fmt::format("{},{}", rate, seqNum);
+  };
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(rate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        knobVal()}});
+
+  rate = 9999;
+  seqNum = 100;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(rate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        knobVal()}});
+}
+
+class OutOfOrderMaxPacingRateKnobSequencedFrameTest
+    : public QuicServerTransportTest,
+      public testing::WithParamInterface<uint64_t> {};
+
+TEST_P(
+    OutOfOrderMaxPacingRateKnobSequencedFrameTest,
+    TestMaxPacingRateKnobSequencedWithOutOfOrderFrames) {
+  auto mockPacer = std::make_unique<NiceMock<MockPacer>>();
+  auto rawPacer = mockPacer.get();
+  server->getNonConstConn().pacer = std::move(mockPacer);
+
+  // first frame received with seqNum
+  uint64_t rate = 5678;
+  uint64_t seqNum = GetParam();
+  auto serializedKnobVal = [&rate, &seqNum]() {
+    return fmt::format("{},{}", rate, seqNum);
+  };
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(rate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        serializedKnobVal()}});
+
+  // second frame received with the same seqNum, should be rejected regardless
+  // of pacing rate being different
+  rate = 1234;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(_)).Times(0);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        serializedKnobVal()}});
+
+  // second frame received with sequence number being less than seqNum, should
+  // be rejected
+  if (seqNum > 0) {
+    rate = 8888;
+    seqNum = GetParam() - 1;
+    EXPECT_CALL(*rawPacer, setMaxPacingRate(_)).Times(0);
+    server->handleKnobParams(
+        {{static_cast<uint64_t>(
+              TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+          serializedKnobVal()}});
+  }
+
+  // third frame received with sequence number = seqNum + 1, should be accepted
+  rate = 9999;
+  seqNum = GetParam() + 1;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(rate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        serializedKnobVal()}});
+
+  // forth frame received with larger sequence number should be accepted
+  rate = 1111;
+  seqNum = GetParam() + 1000;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(rate)).Times(1);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(
+            TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+        serializedKnobVal()}});
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    OutOfOrderMaxPacingRateKnobSequencedFrameTests,
+    OutOfOrderMaxPacingRateKnobSequencedFrameTest,
+    ::testing::Values(0, 1, 7, 42));
+
+/*
+ * Verify that if the transport receives a request to set max pacing rate after
+ * out of order frame detected, then the request to set max pacing will not be
+ * processed.
+ *
+ *   NO_PACING --> NO_PACING --> PACING
+ */
+TEST_F(QuicServerTransportTest, TestSetMaxPacingRateFrameOutOfOrder) {
+  auto mockPacer = std::make_unique<NiceMock<MockPacer>>();
+  auto rawPacer = mockPacer.get();
+  server->getNonConstConn().pacer = std::move(mockPacer);
+
+  // verify init state NO_PACING
+  auto maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_FALSE(maxPacingRateKnobState.frameOutOfOrderDetected);
+  EXPECT_EQ(kTestMaxPacingRate, maxPacingRateKnobState.lastMaxRateBytesPerSec);
+
+  // disable pacing while the current pacing state is still NO_PACING, should
+  // detect out of order frame
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(kTestMaxPacingRate)).Times(0);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        kTestMaxPacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_TRUE(maxPacingRateKnobState.frameOutOfOrderDetected);
+
+  // any attempt to set max pacing rate from now on should fail
+  uint64_t pacingRate = 1234;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(pacingRate)).Times(0);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        pacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_TRUE(maxPacingRateKnobState.frameOutOfOrderDetected);
+
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(kTestMaxPacingRate)).Times(0);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        kTestMaxPacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_TRUE(maxPacingRateKnobState.frameOutOfOrderDetected);
+
+  pacingRate = 5678;
+  EXPECT_CALL(*rawPacer, setMaxPacingRate(pacingRate)).Times(0);
+  server->handleKnobParams(
+      {{static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
+        pacingRate}});
+  maxPacingRateKnobState = server->getConn().maxPacingRateKnobState;
+  EXPECT_TRUE(maxPacingRateKnobState.frameOutOfOrderDetected);
 }
 
 class QuicServerTransportForciblySetUDUPayloadSizeTest
@@ -4317,7 +4722,7 @@ TEST_F(
   server->handleKnobParams(
       {{static_cast<uint64_t>(
             TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE),
-        1}});
+        uint64_t{1}}});
   EXPECT_EQ(server->getConn().udpSendPacketLen, 1452);
 }
 

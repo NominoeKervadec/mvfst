@@ -95,10 +95,36 @@ class QuicSocket {
     virtual void onNewBidirectionalStream(StreamId id) noexcept = 0;
 
     /**
+     * Invoked when the peer creates a new bidirectional stream group.
+     */
+    virtual void onNewBidirectionalStreamGroup(StreamGroupId) noexcept {}
+
+    /**
+     * Invoked when the peer creates a new bidirectional stream in a specific
+     * group.
+     */
+    virtual void onNewBidirectionalStreamInGroup(
+        StreamId,
+        StreamGroupId) noexcept {}
+
+    /**
      * Invoked when the peer creates a new unidirectional stream.  The most
      * common flow would be to set the ReadCallback from here
      */
     virtual void onNewUnidirectionalStream(StreamId id) noexcept = 0;
+
+    /**
+     * Invoked when the peer creates a new unidirectional stream group.
+     */
+    virtual void onNewUnidirectionalStreamGroup(StreamGroupId) noexcept {}
+
+    /**
+     * Invoked when the peer creates a new unidirectional stream in a specific
+     * group.
+     */
+    virtual void onNewUnidirectionalStreamInGroup(
+        StreamId,
+        StreamGroupId) noexcept {}
 
     /**
      * Invoked when a stream receives a StopSending frame from a peer.
@@ -472,6 +498,13 @@ class QuicSocket {
   getStreamFlowControl(StreamId id) const = 0;
 
   /**
+   * Returns the minimum of current send flow control window and available
+   * buffer space.
+   */
+  virtual folly::Expected<uint64_t, LocalErrorCode> getMaxWritableOnStream(
+      StreamId id) const = 0;
+
+  /**
    * Sets the flow control window for the connection.
    * Use setStreamFlowControlWindow for per Stream flow control.
    */
@@ -543,10 +576,21 @@ class QuicSocket {
      */
     virtual void readAvailable(StreamId id) noexcept = 0;
 
+    /*
+     * Same as above, but called on streams within a group.
+     */
+    virtual void readAvailableWithGroup(StreamId, StreamGroupId) noexcept {}
+
     /**
      * Called from the transport layer when there is an error on the stream.
      */
     virtual void readError(StreamId id, QuicError error) noexcept = 0;
+
+    /**
+     * Same as above, but called on streams within a group.
+     */
+    virtual void
+    readErrorWithGroup(StreamId, StreamGroupId, QuicError) noexcept {}
   };
 
   /**
@@ -755,6 +799,30 @@ class QuicSocket {
    */
   virtual folly::Expected<StreamId, LocalErrorCode> createUnidirectionalStream(
       bool replaySafe = true) = 0;
+
+  /**
+   *  Create a bidirectional stream group.
+   */
+  virtual folly::Expected<StreamGroupId, LocalErrorCode>
+  createBidirectionalStreamGroup() = 0;
+
+  /**
+   *  Create a unidirectional stream group.
+   */
+  virtual folly::Expected<StreamGroupId, LocalErrorCode>
+  createUnidirectionalStreamGroup() = 0;
+
+  /**
+   *  Same as createBidirectionalStream(), but creates a stream in a group.
+   */
+  virtual folly::Expected<StreamId, LocalErrorCode>
+  createBidirectionalStreamInGroup(StreamGroupId groupId) = 0;
+
+  /**
+   *  Same as createBidirectionalStream(), but creates a stream in a group.
+   */
+  virtual folly::Expected<StreamId, LocalErrorCode>
+  createUnidirectionalStreamInGroup(StreamGroupId groupId) = 0;
 
   /**
    * Returns the number of bidirectional streams that can be opened.
@@ -1181,6 +1249,12 @@ class QuicSocket {
    */
   virtual void setCongestionControl(CongestionControlType type) = 0;
 
+  /**
+   * Add a packet processor
+   */
+  virtual void addPacketProcessor(
+      std::shared_ptr<PacketProcessor> packetProcessor) = 0;
+
   using Observer = SocketObserverContainer::Observer;
   using ManagedObserver = SocketObserverContainer::ManagedObserver;
 
@@ -1201,6 +1275,22 @@ class QuicSocket {
   }
 
   /**
+   * Adds an observer.
+   *
+   * If the observer is already added, this is a no-op.
+   *
+   * @param observer     Observer to add.
+   * @return             Whether the observer was added (fails if no list).
+   */
+  bool addObserver(std::shared_ptr<Observer> observer) {
+    if (auto list = getSocketObserverContainer()) {
+      list->addObserver(std::move(observer));
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Removes an observer.
    *
    * @param observer     Observer to remove.
@@ -1209,6 +1299,19 @@ class QuicSocket {
   bool removeObserver(Observer* observer) {
     if (auto list = getSocketObserverContainer()) {
       return list->removeObserver(observer);
+    }
+    return false;
+  }
+
+  /**
+   * Removes an observer.
+   *
+   * @param observer     Observer to remove.
+   * @return             Whether the observer was found and removed.
+   */
+  bool removeObserver(std::shared_ptr<Observer> observer) {
+    if (auto list = getSocketObserverContainer()) {
+      return list->removeObserver(std::move(observer));
     }
     return false;
   }

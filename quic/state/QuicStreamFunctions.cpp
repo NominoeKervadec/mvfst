@@ -386,10 +386,10 @@ bool allBytesTillFinAcked(const QuicStreamState& stream) {
    * 4. We have no bytes left to write
    * 5. We have no bytes that are detected as lost.
    */
-  return stream.finalWriteOffset &&
-      stream.currentWriteOffset > *stream.finalWriteOffset &&
-      stream.retransmissionBuffer.empty() && stream.writeBuffer.empty() &&
-      stream.lossBuffer.empty();
+  return stream.hasSentFIN() && stream.retransmissionBuffer.empty() &&
+      stream.retransmissionBufMetas.empty() && stream.writeBuffer.empty() &&
+      !stream.hasWritableBufMeta() && stream.lossBuffer.empty() &&
+      stream.lossBufMetas.empty();
 }
 
 void appendPendingStreamReset(
@@ -422,18 +422,21 @@ void appendPendingStreamReset(
 }
 
 uint64_t getLargestWriteOffsetSeen(const QuicStreamState& stream) {
-  return stream.finalWriteOffset.value_or(
-      stream.currentWriteOffset + stream.writeBuffer.chainLength());
+  return stream.finalWriteOffset.value_or(std::max<uint64_t>(
+      stream.currentWriteOffset + stream.writeBuffer.chainLength(),
+      stream.writeBufMeta.offset + stream.writeBufMeta.length));
 }
 
 folly::Optional<uint64_t> getLargestWriteOffsetTxed(
     const QuicStreamState& stream) {
   // currentWriteOffset is really nextWriteOffset
   // when 0, it indicates nothing has been written yet
-  if (stream.currentWriteOffset == 0) {
+  if (stream.currentWriteOffset == 0 && stream.writeBufMeta.offset == 0) {
     return folly::none;
   }
-  return stream.currentWriteOffset - 1;
+  uint64_t currentWriteOffset =
+      std::max<uint64_t>(stream.currentWriteOffset, stream.writeBufMeta.offset);
+  return currentWriteOffset - 1;
 }
 
 folly::Optional<uint64_t> getLargestDeliverableOffset(

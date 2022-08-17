@@ -245,7 +245,7 @@ SchedulingResult FrameScheduler::scheduleFramesForPacket(
     rstWritten = rstScheduler_->writeRsts(wrapper);
   }
   // Long time ago we decided RST has higher priority than Acks.
-  if (ackScheduler_ && ackScheduler_->hasPendingAcks()) {
+  if (hasPendingAcks()) {
     if (cryptoDataWritten || rstWritten) {
       // If packet has non ack data, it is subject to congestion control. We
       // need to use the wrapper/
@@ -317,8 +317,7 @@ void FrameScheduler::writeNextAcks(PacketBuilderInterface& builder) {
 }
 
 bool FrameScheduler::hasData() const {
-  return (ackScheduler_ && ackScheduler_->hasPendingAcks()) ||
-      hasImmediateData();
+  return (hasPendingAcks()) || hasImmediateData();
 }
 
 bool FrameScheduler::hasPendingAcks() const {
@@ -358,7 +357,8 @@ bool StreamFrameScheduler::writeStreamLossBuffers(
         bufferLen, // writeBufferLen -- only the len of the single buffer.
         bufferLen, // flowControlLen -- not relevant, already flow controlled.
         buffer->eof,
-        folly::none /* skipLenHint */);
+        folly::none /* skipLenHint */,
+        stream.groupId);
     if (dataLen) {
       wroteStreamFrame = true;
       writeStreamFrameData(builder, buffer->data, *dataLen);
@@ -531,7 +531,8 @@ bool StreamFrameScheduler::writeStreamFrame(
       bufferLen,
       flowControlLen,
       canWriteFin,
-      folly::none /* skipLenHint */);
+      folly::none /* skipLenHint */,
+      stream.groupId);
   if (!dataLen) {
     return false;
   }
@@ -804,7 +805,7 @@ SchedulingResult CloningScheduler::scheduleFramesForPacket(
   // now.
   bool hasData = frameScheduler_.hasData();
   if (conn_.version.has_value() &&
-      conn_.version.value() == QuicVersion::MVFST_EXPERIMENTAL2) {
+      conn_.version.value() != QuicVersion::QUIC_V1) {
     hasData = frameScheduler_.hasImmediateData();
   }
   if (hasData) {

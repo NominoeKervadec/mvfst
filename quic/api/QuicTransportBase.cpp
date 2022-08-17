@@ -673,6 +673,19 @@ QuicTransportBase::getStreamFlowControl(StreamId id) const {
       stream->flowControlState.advertisedMaxOffset);
 }
 
+folly::Expected<uint64_t, LocalErrorCode>
+QuicTransportBase::getMaxWritableOnStream(StreamId id) const {
+  if (!conn_->streamManager->streamExists(id)) {
+    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  if (isReceivingStream(conn_->nodeType, id)) {
+    return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+
+  auto stream = CHECK_NOTNULL(conn_->streamManager->getStream(id));
+  return maxWritableOnStream(*stream);
+}
+
 folly::Expected<folly::Unit, LocalErrorCode>
 QuicTransportBase::setConnectionFlowControlWindow(uint64_t windowSize) {
   if (closeState_ != CloseState::OPEN) {
@@ -854,12 +867,21 @@ void QuicTransportBase::invokeReadDataAndCallbacks() {
       peekCallbacks_.erase(streamId);
       VLOG(10) << "invoking read error callbacks on stream=" << streamId << " "
                << *this;
-      readCb->readError(streamId, QuicError(*stream->streamReadError));
+      if (!stream->groupId) {
+        readCb->readError(streamId, QuicError(*stream->streamReadError));
+      } else {
+        readCb->readErrorWithGroup(
+            streamId, *stream->groupId, QuicError(*stream->streamReadError));
+      }
     } else if (
         readCb && callback->second.resumed && stream->hasReadableData()) {
       VLOG(10) << "invoking read callbacks on stream=" << streamId << " "
                << *this;
-      readCb->readAvailable(streamId);
+      if (!stream->groupId) {
+        readCb->readAvailable(streamId);
+      } else {
+        readCb->readAvailableWithGroup(streamId, *stream->groupId);
+      }
     }
   }
   if (self->datagramCallback_ && !conn_->datagramState.readBuffer.empty()) {
@@ -1538,11 +1560,24 @@ void QuicTransportBase::handleCancelByteEventCallbacks() {
   }
 }
 
-void QuicTransportBase::handleNewStreamCallbacks(
-    std::vector<StreamId>& streamStorage) {
-  streamStorage =
-      conn_->streamManager->consumeNewPeerStreams(std::move(streamStorage));
+void QuicTransportBase::logStreamOpenEvent(StreamId streamId) {
+  if (getSocketObserverContainer() &&
+      getSocketObserverContainer()
+          ->hasObserversForEvent<
+              SocketObserverInterface::Events::streamEvents>()) {
+    getSocketObserverContainer()
+        ->invokeInterfaceMethod<SocketObserverInterface::Events::streamEvents>(
+            [event = SocketObserverInterface::StreamOpenEvent(
+                 streamId,
+                 getStreamInitiator(streamId),
+                 getStreamDirectionality(streamId))](
+                auto observer, auto observed) {
+              observer->streamOpened(observed, event);
+            });
+  }
+}
 
+void QuicTransportBase::handleNewStreams(std::vector<StreamId>& streamStorage) {
   const auto& newPeerStreamIds = streamStorage;
   for (const auto& streamId : newPeerStreamIds) {
     CHECK_NOTNULL(connCallback_);
@@ -1552,28 +1587,58 @@ void QuicTransportBase::handleNewStreamCallbacks(
       connCallback_->onNewUnidirectionalStream(streamId);
     }
 
-    if (getSocketObserverContainer() &&
-        getSocketObserverContainer()
-            ->hasObserversForEvent<
-                SocketObserverInterface::Events::streamEvents>()) {
-      getSocketObserverContainer()
-          ->invokeInterfaceMethod<
-              SocketObserverInterface::Events::streamEvents>(
-              [event = SocketObserverInterface::StreamOpenEvent(
-                   streamId,
-                   getStreamInitiator(streamId),
-                   getStreamDirectionality(streamId))](
-                  auto observer, auto observed) {
-                observer->streamOpened(observed, event);
-              });
-    }
-
+    logStreamOpenEvent(streamId);
     if (closeState_ != CloseState::OPEN) {
       return;
     }
   }
-
   streamStorage.clear();
+}
+
+void QuicTransportBase::handleNewGroupedStreams(
+    std::vector<StreamId>& streamStorage) {
+  const auto& newPeerStreamIds = streamStorage;
+  for (const auto& streamId : newPeerStreamIds) {
+    CHECK_NOTNULL(connCallback_);
+    auto stream = conn_->streamManager->getStream(streamId);
+    CHECK(stream->groupId);
+    if (isBidirectionalStream(streamId)) {
+      connCallback_->onNewBidirectionalStreamInGroup(
+          streamId, *stream->groupId);
+    } else {
+      connCallback_->onNewUnidirectionalStreamInGroup(
+          streamId, *stream->groupId);
+    }
+
+    logStreamOpenEvent(streamId);
+    if (closeState_ != CloseState::OPEN) {
+      return;
+    }
+  }
+  streamStorage.clear();
+}
+
+void QuicTransportBase::handleNewStreamCallbacks(
+    std::vector<StreamId>& streamStorage) {
+  streamStorage =
+      conn_->streamManager->consumeNewPeerStreams(std::move(streamStorage));
+  handleNewStreams(streamStorage);
+}
+
+void QuicTransportBase::handleNewGroupedStreamCallbacks(
+    std::vector<StreamId>& streamStorage) {
+  auto newStreamGroups = conn_->streamManager->consumeNewPeerStreamGroups();
+  for (auto newStreamGroupId : newStreamGroups) {
+    if (isBidirectionalStream(newStreamGroupId)) {
+      connCallback_->onNewBidirectionalStreamGroup(newStreamGroupId);
+    } else {
+      connCallback_->onNewUnidirectionalStreamGroup(newStreamGroupId);
+    }
+  }
+
+  streamStorage = conn_->streamManager->consumeNewGroupedPeerStreams(
+      std::move(streamStorage));
+  handleNewGroupedStreams(streamStorage);
 }
 
 void QuicTransportBase::handleDeliveryCallbacks() {
@@ -1718,6 +1783,11 @@ void QuicTransportBase::processCallbacksAfterNetworkData() {
   std::vector<StreamId> tempStorage;
 
   handleNewStreamCallbacks(tempStorage);
+  if (closeState_ != CloseState::OPEN) {
+    return;
+  }
+
+  handleNewGroupedStreamCallbacks(tempStorage);
   if (closeState_ != CloseState::OPEN) {
     return;
   }
@@ -1910,15 +1980,19 @@ uint64_t QuicTransportBase::getNumOpenableUnidirectionalStreams() const {
 }
 
 folly::Expected<StreamId, LocalErrorCode>
-QuicTransportBase::createStreamInternal(bool bidirectional) {
+QuicTransportBase::createStreamInternal(
+    bool bidirectional,
+    const folly::Optional<StreamGroupId>& streamGroupId) {
   if (closeState_ != CloseState::OPEN) {
     return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
   }
   folly::Expected<QuicStreamState*, LocalErrorCode> streamResult;
   if (bidirectional) {
-    streamResult = conn_->streamManager->createNextBidirectionalStream();
+    streamResult =
+        conn_->streamManager->createNextBidirectionalStream(streamGroupId);
   } else {
-    streamResult = conn_->streamManager->createNextUnidirectionalStream();
+    streamResult =
+        conn_->streamManager->createNextUnidirectionalStream(streamGroupId);
   }
   if (streamResult) {
     const StreamId streamId = streamResult.value()->id;
@@ -1953,6 +2027,32 @@ QuicTransportBase::createBidirectionalStream(bool /*replaySafe*/) {
 folly::Expected<StreamId, LocalErrorCode>
 QuicTransportBase::createUnidirectionalStream(bool /*replaySafe*/) {
   return createStreamInternal(false);
+}
+
+folly::Expected<StreamGroupId, LocalErrorCode>
+QuicTransportBase::createBidirectionalStreamGroup() {
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  return conn_->streamManager->createNextBidirectionalStreamGroup();
+}
+
+folly::Expected<StreamGroupId, LocalErrorCode>
+QuicTransportBase::createUnidirectionalStreamGroup() {
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  return conn_->streamManager->createNextUnidirectionalStreamGroup();
+}
+
+folly::Expected<StreamId, LocalErrorCode>
+QuicTransportBase::createBidirectionalStreamInGroup(StreamGroupId groupId) {
+  return createStreamInternal(true, groupId);
+}
+
+folly::Expected<StreamId, LocalErrorCode>
+QuicTransportBase::createUnidirectionalStreamInGroup(StreamGroupId groupId) {
+  return createStreamInternal(false, groupId);
 }
 
 bool QuicTransportBase::isClientStream(StreamId stream) noexcept {
@@ -2078,7 +2178,8 @@ QuicTransportBase::notifyPendingWriteOnStream(StreamId id, WriteCallback* wcb) {
   return folly::unit;
 }
 
-uint64_t QuicTransportBase::maxWritableOnStream(const QuicStreamState& stream) {
+uint64_t QuicTransportBase::maxWritableOnStream(
+    const QuicStreamState& stream) const {
   auto connWritableBytes = maxWritableOnConn();
   auto streamFlowControlBytes = getSendStreamFlowControlBytesAPI(stream);
   auto flowControlAllowedBytes =
@@ -2086,7 +2187,7 @@ uint64_t QuicTransportBase::maxWritableOnStream(const QuicStreamState& stream) {
   return flowControlAllowedBytes;
 }
 
-uint64_t QuicTransportBase::maxWritableOnConn() {
+uint64_t QuicTransportBase::maxWritableOnConn() const {
   auto connWritableBytes = getSendConnFlowControlBytesAPI(*conn_);
   auto availableBufferSpace = bufferSpaceAvailable();
   return std::min(connWritableBytes, availableBufferSpace);
@@ -2815,7 +2916,12 @@ void QuicTransportBase::cancelAllAppCallbacks(const QuicError& err) noexcept {
   for (auto& cb : readCallbacksCopy) {
     readCallbacks_.erase(cb.first);
     if (cb.second.readCb) {
-      cb.second.readCb->readError(cb.first, err);
+      auto stream = conn_->streamManager->getStream(cb.first);
+      if (!stream->groupId) {
+        cb.second.readCb->readError(cb.first, err);
+      } else {
+        cb.second.readCb->readErrorWithGroup(cb.first, *stream->groupId, err);
+      }
     }
   }
 
@@ -2871,8 +2977,14 @@ void QuicTransportBase::resetNonControlStreams(
       auto readCallbackIt = readCallbacks_.find(id);
       if (readCallbackIt != readCallbacks_.end() &&
           readCallbackIt->second.readCb) {
-        readCallbackIt->second.readCb->readError(
-            id, QuicError(error, errorMsg.str()));
+        auto stream = conn_->streamManager->getStream(id);
+        if (!stream->groupId) {
+          readCallbackIt->second.readCb->readError(
+              id, QuicError(error, errorMsg.str()));
+        } else {
+          readCallbackIt->second.readCb->readErrorWithGroup(
+              id, *stream->groupId, QuicError(error, errorMsg.str()));
+        }
       }
       peekCallbacks_.erase(id);
       stopSending(id, error);
@@ -3330,6 +3442,12 @@ void QuicTransportBase::setCongestionControl(CongestionControlType type) {
   }
 }
 
+void QuicTransportBase::addPacketProcessor(
+    std::shared_ptr<PacketProcessor> packetProcessor) {
+  DCHECK(conn_);
+  conn_->packetProcessors.push_back(std::move(packetProcessor));
+}
+
 bool QuicTransportBase::isDetachable() {
   // only the client is detachable.
   return conn_->nodeType == QuicNodeType::Client;
@@ -3557,6 +3675,9 @@ QuicSocket::WriteResult QuicTransportBase::setDSRPacketizationRequestSender(
       return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
     }
     stream->dsrSender = std::move(sender);
+    // Always set adaptive reordering when using DSR for now since it ends up
+    // being crucial to avoid spurious losses when there are multiple senders.
+    conn_->transportSettings.useAdaptiveLossReorderingThresholds = true;
     // Fow now, no appLimited or appIdle update here since we are not writing
     // either BufferMetas yet. The first BufferMeta write will update it.
   } catch (const QuicTransportException& ex) {

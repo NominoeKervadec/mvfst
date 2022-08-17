@@ -298,7 +298,9 @@ DataPathResult continuousMemoryBuildScheduleEncrypt(
   // Include previous packets back.
   packetBuf->prepend(prevSize);
   connection.bufAccessor->release(std::move(packetBuf));
-#if !FOLLY_MOBILE
+#if !FOLLY_MOBILE && \
+    !defined(_MSC_VER) // The second condition should be removed once we
+                       // transition to folly XLOG.
   bool isD6DProbe = pnSpace == PacketNumberSpace::AppData &&
       connection.d6d.lastProbe.hasValue() &&
       connection.d6d.lastProbe->packetNum == packetNum;
@@ -380,7 +382,9 @@ DataPathResult iobufChainBasedBuildScheduleEncrypt(
       headerCipher);
   auto encodedSize = packetBuf->computeChainDataLength();
   auto encodedBodySize = encodedSize - headerLen;
-#if !FOLLY_MOBILE
+#if !FOLLY_MOBILE && \
+    !defined(_MSC_VER) // The second condition should be removed once we
+  // transition to folly XLOG.
   if (encodedSize > connection.udpSendPacketLen) {
     LOG_EVERY_N(ERROR, 5000)
         << "Quic sending pkt larger than limit, encodedSize=" << encodedSize
@@ -916,6 +920,10 @@ void updateConnection(
   if (conn.pacer) {
     conn.pacer->onPacketSent();
   }
+  for (auto& packetProcessor : conn.packetProcessors) {
+    packetProcessor->onPacketSent(pkt);
+  }
+
   if (conn.pathValidationLimiter &&
       (conn.pendingEvents.pathChallenge || conn.outstandingPathValidation)) {
     conn.pathValidationLimiter->onPacketSent(pkt.metadata.encodedSize);
@@ -1786,6 +1794,36 @@ bool hasInitialOrHandshakeCiphers(QuicConnectionStateBase& conn) {
   return conn.initialWriteCipher || conn.handshakeWriteCipher ||
       conn.readCodec->getInitialCipher() ||
       conn.readCodec->getHandshakeReadCipher();
+}
+
+bool setCustomTransportParameter(
+    std::unique_ptr<CustomTransportParameter> customParam,
+    std::vector<TransportParameter>& customTransportParameters) {
+  // Check that the parameter id is in the "private parameter" range, as
+  // described by the spec.
+  if (static_cast<uint16_t>(customParam->getParameterId()) <
+      kCustomTransportParameterThreshold) {
+    LOG(ERROR) << "invalid parameter id";
+    return false;
+  }
+
+  // check to see that we haven't already added in a parameter with the
+  // specified parameter id
+  auto it = std::find_if(
+      customTransportParameters.begin(),
+      customTransportParameters.end(),
+      [&customParam](const TransportParameter& param) {
+        return param.parameter == customParam->getParameterId();
+      });
+
+  // if a match has been found, we return failure
+  if (it != customTransportParameters.end()) {
+    LOG(ERROR) << "transport parameter already present";
+    return false;
+  }
+
+  customTransportParameters.push_back(customParam->encode());
+  return true;
 }
 
 } // namespace quic

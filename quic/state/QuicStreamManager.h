@@ -21,7 +21,10 @@ namespace quic {
 namespace detail {
 
 constexpr uint8_t kStreamIncrement = 0x04;
-}
+constexpr uint8_t kStreamGroupIncrement = 0x04;
+constexpr uint64_t kMaxStreamGroupId = 128 * kStreamGroupIncrement;
+
+} // namespace detail
 
 class QuicStreamManager {
  public:
@@ -55,6 +58,8 @@ class QuicStreamManager {
       initialRemoteBidirectionalStreamId_ = 0x01;
       initialRemoteUnidirectionalStreamId_ = 0x03;
     }
+    nextBidirectionalStreamGroupId_ = nextBidirectionalStreamId_;
+    nextUnidirectionalStreamGroupId_ = nextUnidirectionalStreamId_;
     refreshTransportSettings(transportSettings);
   }
 
@@ -80,6 +85,8 @@ class QuicStreamManager {
         other.nextAcceptableLocalUnidirectionalStreamId_;
     nextBidirectionalStreamId_ = other.nextBidirectionalStreamId_;
     nextUnidirectionalStreamId_ = other.nextUnidirectionalStreamId_;
+    nextBidirectionalStreamGroupId_ = other.nextBidirectionalStreamGroupId_;
+    nextUnidirectionalStreamGroupId_ = other.nextUnidirectionalStreamGroupId_;
     maxLocalBidirectionalStreamId_ = other.maxLocalBidirectionalStreamId_;
     maxLocalUnidirectionalStreamId_ = other.maxLocalUnidirectionalStreamId_;
     maxRemoteBidirectionalStreamId_ = other.maxRemoteBidirectionalStreamId_;
@@ -107,7 +114,14 @@ class QuicStreamManager {
         std::move(other.openBidirectionalLocalStreams_);
     openUnidirectionalLocalStreams_ =
         std::move(other.openUnidirectionalLocalStreams_);
+    openBidirectionalLocalStreamGroups_ =
+        std::move(other.openBidirectionalLocalStreamGroups_);
+    openUnidirectionalLocalStreamGroups_ =
+        std::move(other.openUnidirectionalLocalStreamGroups_);
     newPeerStreams_ = std::move(other.newPeerStreams_);
+    newPeerStreamGroups_ = std::move(other.newPeerStreamGroups_);
+    peerStreamGroupsSeen_ = std::move(other.peerStreamGroupsSeen_);
+    newGroupedPeerStreams_ = std::move(other.newGroupedPeerStreams_);
     blockedStreams_ = std::move(other.blockedStreams_);
     stopSendingStreams_ = std::move(other.stopSendingStreams_);
     streamPriorityLevelsNoCtrl_ = std::move(other.streamPriorityLevelsNoCtrl_);
@@ -146,25 +160,42 @@ class QuicStreamManager {
    * function is only used internally or for testing.
    */
   folly::Expected<QuicStreamState*, LocalErrorCode> createStream(
-      StreamId streamId);
+      StreamId streamId,
+      folly::Optional<StreamGroupId> streamGroupId = folly::none);
+
+  /*
+   * Create a new bidirectional stream group.
+   */
+  folly::Expected<StreamGroupId, LocalErrorCode>
+  createNextBidirectionalStreamGroup();
 
   /*
    * Create and return the state for the next available bidirectional stream.
    */
   folly::Expected<QuicStreamState*, LocalErrorCode>
-  createNextBidirectionalStream();
+  createNextBidirectionalStream(
+      folly::Optional<StreamGroupId> streamGroupId = folly::none);
+
+  /*
+   * Create a new unidirectional stream group.
+   */
+  folly::Expected<StreamGroupId, LocalErrorCode>
+  createNextUnidirectionalStreamGroup();
 
   /*
    * Create and return the state for the next available unidirectional stream.
    */
   folly::Expected<QuicStreamState*, LocalErrorCode>
-  createNextUnidirectionalStream();
+  createNextUnidirectionalStream(
+      folly::Optional<StreamGroupId> streamGroupId = folly::none);
 
   /*
    * Return the stream state or create it if the state has not yet been created.
    * Note that this is only valid for streams that are currently open.
    */
-  QuicStreamState* FOLLY_NULLABLE getStream(StreamId streamId);
+  QuicStreamState* FOLLY_NULLABLE getStream(
+      StreamId streamId,
+      folly::Optional<StreamGroupId> streamGroupId = folly::none);
 
   /*
    * Remove all the state for a stream that is being closed.
@@ -298,13 +329,6 @@ class QuicStreamManager {
   }
 
   /*
-   * Clear the new peer streams, presumably after all have been processed.
-   */
-  void clearNewPeerStreams() {
-    newPeerStreams_.clear();
-  }
-
-  /*
    * Clear all the currently open streams.
    */
   void clearOpenStreams() {
@@ -312,6 +336,9 @@ class QuicStreamManager {
     openUnidirectionalLocalStreams_.clear();
     openBidirectionalPeerStreams_.clear();
     openUnidirectionalPeerStreams_.clear();
+    openBidirectionalLocalStreamGroups_.clear();
+    openUnidirectionalLocalStreamGroups_.clear();
+    peerStreamGroupsSeen_.clear();
     streams_.clear();
   }
 
@@ -345,7 +372,7 @@ class QuicStreamManager {
   }
 
   void updateLossStreams(const QuicStreamState& stream) {
-    if (stream.lossBuffer.empty()) {
+    if (!stream.hasLoss()) {
       removeLoss(stream.id);
     } else {
       addLoss(stream.id);
@@ -817,11 +844,22 @@ class QuicStreamManager {
    * Consume the new peer streams using the parameter vector.
    */
   auto consumeNewPeerStreams(std::vector<StreamId>&& storage) {
-    std::vector<StreamId> result = storage;
-    result.clear();
-    result.reserve(newPeerStreams_.size());
-    result.insert(result.end(), newPeerStreams_.begin(), newPeerStreams_.end());
-    newPeerStreams_.clear();
+    return swapStreams(newPeerStreams_, std::move(storage));
+  }
+
+  /*
+   * Consume the new peer streams in groups using the parameter vector.
+   */
+  auto consumeNewGroupedPeerStreams(std::vector<StreamId>&& storage) {
+    return swapStreams(newGroupedPeerStreams_, std::move(storage));
+  }
+
+  /*
+   * Consume the new peer stream groups using the parameter vector.
+   */
+  auto consumeNewPeerStreamGroups() {
+    std::set<StreamGroupId> result;
+    result.swap(newPeerStreamGroups_);
     return result;
   }
 
@@ -916,6 +954,28 @@ class QuicStreamManager {
    */
   [[nodiscard]] PriorityLevel getHighestPriorityLevel() const;
 
+  /*
+   * Returns number of bidirectional groups.
+   */
+  [[nodiscard]] bool getNumBidirectionalGroups() const {
+    return openBidirectionalLocalStreamGroups_.size();
+  }
+
+  /*
+   * Returns number of unidirectional group exists.
+   */
+  [[nodiscard]] bool getNumUnidirectionalGroups() const {
+    return openUnidirectionalLocalStreamGroups_.size();
+  }
+
+  [[nodiscard]] size_t getNumNewPeerStreamGroups() const {
+    return newPeerStreamGroups_.size();
+  }
+
+  [[nodiscard]] size_t getNumPeerStreamGroupsSeen() const {
+    return peerStreamGroupsSeen_.size();
+  }
+
  private:
   // Updates the congestion controller app-idle state, after a change in the
   // number of streams.
@@ -928,7 +988,9 @@ class QuicStreamManager {
   QuicStreamState* FOLLY_NULLABLE
   getOrCreateOpenedLocalStream(StreamId streamId);
 
-  QuicStreamState* FOLLY_NULLABLE getOrCreatePeerStream(StreamId streamId);
+  QuicStreamState* FOLLY_NULLABLE getOrCreatePeerStream(
+      StreamId streamId,
+      folly::Optional<StreamGroupId> streamGroupId = folly::none);
 
   void setMaxRemoteBidirectionalStreamsInternal(
       uint64_t maxStreams,
@@ -939,6 +1001,29 @@ class QuicStreamManager {
 
   void addToStreamPriorityMap(const QuicStreamState& streamState);
   void notifyStreamPriorityChanges();
+
+  // helper to create a new peer stream.
+  QuicStreamState* FOLLY_NULLABLE instantiatePeerStream(
+      StreamId streamId,
+      folly::Optional<StreamGroupId> groupId);
+
+  folly::Expected<StreamGroupId, LocalErrorCode> createNextStreamGroup(
+      StreamGroupId& groupId,
+      folly::F14FastSet<StreamGroupId>& streamGroups);
+
+  /*
+   * Helper to consume new stream ids.
+   */
+  std::vector<StreamId> swapStreams(
+      std::vector<StreamId>& src,
+      std::vector<StreamId>&& dst) {
+    std::vector<StreamId> result = dst;
+    result.clear();
+    result.reserve(src.size());
+    result.insert(result.end(), src.begin(), src.end());
+    src.clear();
+    return result;
+  }
 
   QuicConnectionStateBase& conn_;
   QuicNodeType nodeType_;
@@ -962,8 +1047,14 @@ class QuicStreamManager {
   // Next bidirectional stream id to use when creating a stream.
   StreamId nextBidirectionalStreamId_{0};
 
+  // Next bidirectional stream group id to use.
+  StreamGroupId nextBidirectionalStreamGroupId_{0};
+
   // Next unidirectional stream id to use when creating a stream.
   StreamId nextUnidirectionalStreamId_{0};
+
+  // Next unidirectional stream group id to use.
+  StreamGroupId nextUnidirectionalStreamGroupId_{0};
 
   StreamId maxLocalBidirectionalStreamId_{0};
 
@@ -1007,11 +1098,26 @@ class QuicStreamManager {
   // Unidirectional streams that are opened locally on the connection.
   folly::F14FastSet<StreamId> openUnidirectionalLocalStreams_;
 
+  // Bidirectional stream groupss that are opened locally on the connection.
+  folly::F14FastSet<StreamGroupId> openBidirectionalLocalStreamGroups_;
+
+  // Unidirectional stream groups that are opened locally on the connection.
+  folly::F14FastSet<StreamGroupId> openUnidirectionalLocalStreamGroups_;
+
   // A map of streams that are active.
   folly::F14FastMap<StreamId, QuicStreamState> streams_;
 
   // Recently opened peer streams.
   std::vector<StreamId> newPeerStreams_;
+
+  // Recently opened peer streams with groups.
+  std::vector<StreamId> newGroupedPeerStreams_;
+
+  // Recently opened peer stream groups.
+  std::set<StreamGroupId> newPeerStreamGroups_;
+
+  // Peer group ids seen.
+  folly::F14FastSet<StreamGroupId> peerStreamGroupsSeen_;
 
   // Map of streams that were blocked
   folly::F14FastMap<StreamId, StreamDataBlockedFrame> blockedStreams_;

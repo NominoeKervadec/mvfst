@@ -15,6 +15,7 @@
 #include <quic/common/BufAccessor.h>
 #include <quic/common/WindowedCounter.h>
 #include <quic/congestion_control/CongestionController.h>
+#include <quic/congestion_control/PacketProcessor.h>
 #include <quic/d6d/ProbeSizeRaiser.h>
 #include <quic/handshake/HandshakeLayer.h>
 #include <quic/logging/QLogger.h>
@@ -330,6 +331,8 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // Connection Congestion controller
   std::unique_ptr<CongestionController> congestionController;
 
+  std::vector<std::shared_ptr<PacketProcessor>> packetProcessors;
+
   // Pacer
   std::unique_ptr<Pacer> pacer;
 
@@ -499,7 +502,7 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   LossState lossState;
 
   // This contains the ack and packet number related states for all three
-  // packet number space.
+  // packet number spaces.
   AckStates ackStates;
 
   struct ConnectionFlowControlState {
@@ -733,6 +736,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   };
 
   DatagramState datagramState;
+
+  // Peer max stream groups advertized.
+  folly::Optional<uint64_t> peerMaxStreamGroupsAdvertized;
 };
 
 std::ostream& operator<<(std::ostream& os, const QuicConnectionStateBase& st);

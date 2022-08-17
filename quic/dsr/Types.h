@@ -61,8 +61,9 @@ struct SendInstruction {
         clientAddress(other.clientAddress),
         packetNum(other.packetNum),
         largestAckedPacketNum(other.largestAckedPacketNum),
+        largestAckedStreamOffset(other.largestAckedStreamOffset),
         streamId(other.streamId),
-        offset(other.offset),
+        streamOffset(other.streamOffset),
         len(other.len),
         fin(other.fin),
         bufMetaStartingOffset(other.bufMetaStartingOffset),
@@ -82,8 +83,9 @@ struct SendInstruction {
         clientAddress(other.clientAddress),
         packetNum(other.packetNum),
         largestAckedPacketNum(other.largestAckedPacketNum),
+        largestAckedStreamOffset(other.largestAckedStreamOffset),
         streamId(other.streamId),
-        offset(other.offset),
+        streamOffset(other.streamOffset),
         len(other.len),
         fin(other.fin),
         bufMetaStartingOffset(other.bufMetaStartingOffset),
@@ -99,8 +101,9 @@ struct SendInstruction {
   PacketNum largestAckedPacketNum{0};
 
   // QUIC Stream info
+  folly::Optional<uint64_t> largestAckedStreamOffset;
   StreamId streamId;
-  uint64_t offset;
+  uint64_t streamOffset;
   uint64_t len;
   bool fin;
   uint64_t bufMetaStartingOffset;
@@ -117,7 +120,10 @@ struct SendInstruction {
           clientAddr(conn.peerAddress),
           streamId(idIn),
           trafficKey(*conn.oneRttWriteCipher->getKey()),
-          cipherSuite(*conn.serverHandshakeLayer->getState().cipher()),
+          // TODO the value_or here is a test hack because it's very difficult
+          // to plumb it down properly at the moment.
+          cipherSuite(conn.serverHandshakeLayer->getState().cipher().value_or(
+              fizz::CipherSuite::TLS_AES_128_GCM_SHA256)),
           packetProtectionKey(conn.oneRttWriteHeaderCipher->getKey()) {}
 
     SendInstruction build() {
@@ -127,8 +133,9 @@ struct SendInstruction {
           clientAddr,
           packetNum,
           largestAckedPacketNum,
+          largestAckedStreamOffset,
           streamId,
-          *offset,
+          *streamOffset,
           *len,
           fin,
           *bufMetaStartingOffset,
@@ -147,8 +154,13 @@ struct SendInstruction {
       return *this;
     }
 
-    Builder& setOffset(uint64_t val) {
-      offset = val;
+    Builder& setLargestAckedStreamOffset(uint64_t val) {
+      largestAckedStreamOffset = val;
+      return *this;
+    }
+
+    Builder& setStreamOffset(uint64_t val) {
+      streamOffset = val;
       return *this;
     }
 
@@ -183,8 +195,9 @@ struct SendInstruction {
     const folly::SocketAddress& clientAddr;
     PacketNum packetNum{0};
     PacketNum largestAckedPacketNum{0};
+    folly::Optional<uint64_t> largestAckedStreamOffset;
     StreamId streamId;
-    folly::Optional<uint64_t> offset;
+    folly::Optional<uint64_t> streamOffset;
     folly::Optional<uint64_t> len;
     bool fin{false};
     folly::Optional<uint64_t> bufMetaStartingOffset;
@@ -199,9 +212,10 @@ struct SendInstruction {
       const ConnectionId& scidIn,
       const folly::SocketAddress& clientAddrIn,
       PacketNum packetNumIn,
-      PacketNum largestAcked,
+      PacketNum largestAckedPacketNumIn,
+      folly::Optional<uint64_t> largestAckedStreamOffsetIn,
       StreamId idIn,
-      uint64_t offsetIn,
+      uint64_t streamOffsetIn,
       uint64_t lenIn,
       bool finIn,
       uint64_t bufMetaStartingOffsetIn,
@@ -212,9 +226,10 @@ struct SendInstruction {
         scid(scidIn),
         clientAddress(clientAddrIn),
         packetNum(packetNumIn),
-        largestAckedPacketNum(largestAcked),
+        largestAckedPacketNum(largestAckedPacketNumIn),
+        largestAckedStreamOffset(largestAckedStreamOffsetIn),
         streamId(idIn),
-        offset(offsetIn),
+        streamOffset(streamOffsetIn),
         len(lenIn),
         fin(finIn),
         bufMetaStartingOffset(bufMetaStartingOffsetIn),

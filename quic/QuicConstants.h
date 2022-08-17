@@ -152,7 +152,9 @@ BETTER_ENUM(
     // Keepalive timer enabled
     KEEPALIVE_ENABLED = 0x7777,
     // Remove from loss buffer on spurious loss
-    REMOVE_FROM_LOSS_BUFFER = 0x8888)
+    REMOVE_FROM_LOSS_BUFFER = 0x8888,
+    // Knob for setting max pacing rate, with sequence number
+    MAX_PACING_RATE_KNOB_SEQUENCED = 0x9999)
 
 enum class FrameType : uint64_t {
   PADDING = 0x00,
@@ -193,6 +195,15 @@ enum class FrameType : uint64_t {
   DATAGRAM_LEN = 0x31,
   KNOB = 0x1550,
   ACK_FREQUENCY = 0xAF,
+  // Stream groups.
+  GROUP_STREAM = 0x32,
+  GROUP_STREAM_FIN = 0x33,
+  GROUP_STREAM_LEN = 0x34,
+  GROUP_STREAM_LEN_FIN = 0x35,
+  GROUP_STREAM_OFF = 0x36,
+  GROUP_STREAM_OFF_FIN = 0x37,
+  GROUP_STREAM_OFF_LEN = 0x38,
+  GROUP_STREAM_OFF_LEN_FIN = 0x39,
 };
 
 inline constexpr uint16_t toFrameError(FrameType frame) {
@@ -286,6 +297,7 @@ enum class QuicVersion : uint32_t {
   MVFST = 0xfaceb002,
   QUIC_DRAFT = 0xff00001d, // Draft-29
   QUIC_V1 = 0x00000001,
+  QUIC_V1_ALIAS = 0xfaceb003,
   MVFST_EXPERIMENTAL = 0xfaceb00e, // Experimental alias for MVFST
   MVFST_ALIAS = 0xfaceb010,
   MVFST_INVALID = 0xfaceb00f,
@@ -658,5 +670,8 @@ using PriorityLevel = uint8_t;
 constexpr uint8_t kDefaultMaxPriority = 7;
 
 constexpr size_t kShortHeaderPaddingModulo = 32;
+
+// Custom transport param enabling stream groups support.
+constexpr uint16_t kStreamGroupsEnabledCustomParamId = 0xFF99;
 
 } // namespace quic

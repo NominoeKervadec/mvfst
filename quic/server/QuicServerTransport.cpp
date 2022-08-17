@@ -16,7 +16,10 @@
 #include <quic/server/handshake/DefaultAppTokenValidator.h>
 #include <quic/server/handshake/StatelessResetGenerator.h>
 
+#include <folly/Optional.h>
+#include <quic/common/TransportKnobs.h>
 #include <algorithm>
+#include <stdexcept>
 
 namespace quic {
 
@@ -463,8 +466,12 @@ void QuicServerTransport::handleTransportKnobParams(
       knobParamId = TransportKnobParamId::_from_integral(param.id);
     }
     if (maybeParamHandler != transportKnobParamHandlers_.end()) {
-      (maybeParamHandler->second)(this, param.val);
-      QUIC_STATS(conn_->statsCallback, onTransportKnobApplied, knobParamId);
+      try {
+        (maybeParamHandler->second)(this, param.val);
+        QUIC_STATS(conn_->statsCallback, onTransportKnobApplied, knobParamId);
+      } catch (const std::exception& /* ex */) {
+        QUIC_STATS(conn_->statsCallback, onTransportKnobError, knobParamId);
+      }
     } else {
       QUIC_STATS(conn_->statsCallback, onTransportKnobError, knobParamId);
     }
@@ -658,7 +665,8 @@ void QuicServerTransport::maybeStartD6DProbing() {
 
 void QuicServerTransport::registerTransportKnobParamHandler(
     uint64_t paramId,
-    std::function<void(QuicServerTransport*, uint64_t)>&& handler) {
+    std::function<void(QuicServerTransport*, TransportKnobParam::Val)>&&
+        handler) {
   transportKnobParamHandlers_.emplace(paramId, std::move(handler));
 }
 
@@ -710,10 +718,12 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(
           TransportKnobParamId::ZERO_PMTU_BLACKHOLE_DETECTION),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
-        if (static_cast<bool>(val)) {
+        // TODO(dvn) TransportKnobParam::Val can probably hold bool value as
+        // well
+        if (static_cast<bool>(std::get<uint64_t>(val))) {
           server_conn->d6d.noBlackholeDetection = true;
           VLOG(3)
               << "Knob param received, pmtu blackhole detection is turned off";
@@ -723,10 +733,10 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(
           TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
-        if (static_cast<bool>(val)) {
+        if (static_cast<bool>(std::get<uint64_t>(val))) {
           server_conn->udpSendPacketLen = server_conn->peerMaxUdpPayloadSize;
           VLOG(3)
               << "Knob param received, udpSendPacketLen is forcibly set to max UDP payload size advertised by peer";
@@ -735,10 +745,11 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
-        auto cctype = static_cast<CongestionControlType>(val);
+        auto cctype =
+            static_cast<CongestionControlType>(std::get<uint64_t>(val));
         VLOG(3) << "Knob param received, set congestion control type to "
                 << congestionControlTypeToString(cctype);
         if (cctype == server_conn->congestionController->type()) {
@@ -761,9 +772,10 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::CC_AGRESSIVENESS_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
+        auto val = std::get<uint64_t>(value);
         if (val < 25 || val > 100) {
           LOG(ERROR)
               << "Invalid CC_AGRESSIVENESS_KNOB value received from client, value = "
@@ -780,9 +792,10 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::STARTUP_RTT_FACTOR_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
+        auto val = std::get<uint64_t>(value);
         uint8_t numerator = (val / 100);
         uint8_t denominator = (val - (numerator * 100));
         VLOG(3) << "Knob param received, set STARTUP rtt factor to ("
@@ -793,9 +806,10 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::DEFAULT_RTT_FACTOR_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
+        auto val = std::get<uint64_t>(value);
         auto numerator = (uint8_t)(val / 100);
         auto denominator = (uint8_t)(val - (numerator * 100));
         VLOG(3) << "Knob param received, set DEFAULT rtt factor to ("
@@ -806,9 +820,10 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::NOTSENT_BUFFER_SIZE_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
+        auto val = std::get<uint64_t>(value);
         VLOG(3) << "Knob param received, set total buffer space available to ("
                 << unsigned(val) << ")";
         server_conn->transportSettings.totalBufferSpaceAvailable = val;
@@ -816,17 +831,111 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::MAX_PACING_RATE_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
+
+        // Check if the server should process this knob, i.e should set the max
+        // pacing rate to the given value. Currently there is a possiblity that
+        // MAX_PACING_RATE_KNOB frames arrive out of order, causing incorrect
+        // max pacing rate to be set on the transport, i.e. the rate is set to a
+        // low value when it should be set to max value (i.e. disabled pacing).
+        //
+        // To address this issue while a new knob ID is introduced (where
+        // sequence number is included alongside the max pacing rate value),
+        // this handler will not call setMaxPacingRate(val) after it has
+        // received two consecutive frames where pacing is disabled, so that it
+        // can prevent the abovementioned scenario where the frames should be:
+        //
+        //   NO_PACING --> PACING --> NO_PACING
+        //
+        // due to out-of-order, becomes:
+        //
+        //   NO_PACING --> NO_PACING --> PACING
+        auto& maxPacingRateKnobState =
+            serverTransport->serverConn_->maxPacingRateKnobState;
+        if (maxPacingRateKnobState.frameOutOfOrderDetected) {
+          throw std::runtime_error(
+              "MAX_PACING_RATE_KNOB frame out of order detected");
+        }
+
+        // if pacing is already disabled and the new value is disabling it,
+        // assume there has been an out of order frame and stop processing
+        // pacing frames
+        if (maxPacingRateKnobState.lastMaxRateBytesPerSec ==
+                std::numeric_limits<uint64_t>::max() &&
+            maxPacingRateKnobState.lastMaxRateBytesPerSec == val) {
+          maxPacingRateKnobState.frameOutOfOrderDetected = true;
+          QUIC_STATS(
+              serverTransport->serverConn_->statsCallback,
+              onTransportKnobOutOfOrder,
+              TransportKnobParamId::MAX_PACING_RATE_KNOB);
+          throw std::runtime_error(
+              "MAX_PACING_RATE_KNOB frame out of order detected");
+        }
+
         VLOG(3) << "Knob param received, set max pacing rate to ("
                 << unsigned(val) << " bytes per second)";
         serverTransport->setMaxPacingRate(val);
+        maxPacingRateKnobState.lastMaxRateBytesPerSec = val;
+      });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(
+          TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED),
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
+        CHECK(serverTransport);
+        auto val = std::get<std::string>(value);
+        std::string rateBytesPerSecStr, seqNumStr;
+        if (!folly::split(',', val, rateBytesPerSecStr, seqNumStr)) {
+          std::string errMsg = fmt::format(
+              "MAX_PACING_RATE_KNOB_SEQUENCED frame value {} is not in expected format: "
+              "{{rate}},{{sequenceNumber}}",
+              val);
+          throw std::runtime_error(errMsg);
+        }
+
+        auto maybeRateBytesPerSec = folly::tryTo<uint64_t>(rateBytesPerSecStr);
+        if (maybeRateBytesPerSec.hasError()) {
+          std::string errMsg = fmt::format(
+              "MAX_PACING_RATE_KNOB_SEQUENCED frame received with invalid rate {}",
+              rateBytesPerSecStr);
+          throw std::runtime_error(errMsg);
+        }
+
+        auto expectedSeqNum = folly::tryTo<uint64_t>(seqNumStr);
+        if (expectedSeqNum.hasError()) {
+          std::string errMsg = fmt::format(
+              "MAX_PACING_RATE_KNOB_SEQUENCED frame received with invalid sequence number {}",
+              seqNumStr);
+          throw std::runtime_error(errMsg);
+        }
+
+        if (serverTransport->serverConn_->maybeLastMaxPacingRateKnobSeqNum >=
+            folly::make_optional(expectedSeqNum.value())) {
+          QUIC_STATS(
+              serverTransport->serverConn_->statsCallback,
+              onTransportKnobOutOfOrder,
+              TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED);
+          throw std::runtime_error(
+              "MAX_PACING_RATE_KNOB_SEQUENCED frame received out of order");
+        }
+
+        VLOG(3) << fmt::format(
+            "MAX_PACING_RATE_KNOB_SEQUENCED frame received with rate {} bytes/sec "
+            "and sequence number {}",
+            maybeRateBytesPerSec.value(),
+            expectedSeqNum.value());
+        serverTransport->setMaxPacingRate(maybeRateBytesPerSec.value());
+        serverTransport->serverConn_->maybeLastMaxPacingRateKnobSeqNum =
+            expectedSeqNum.value();
       });
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::AUTO_BACKGROUND_MODE),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
         uint64_t priorityThreshold = val / kPriorityThresholdKnobMultiplier;
         uint64_t utilizationPercent = val % kPriorityThresholdKnobMultiplier;
         float utilizationFactor = float(utilizationPercent) / 100.0f;
@@ -841,11 +950,11 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::CC_EXPERIMENTAL),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
         if (server_conn->congestionController) {
-          auto enableExperimental = static_cast<bool>(val);
+          auto enableExperimental = static_cast<bool>(std::get<uint64_t>(val));
           server_conn->congestionController->setExperimental(
               enableExperimental);
           VLOG(3) << fmt::format(
@@ -859,8 +968,9 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::SHORT_HEADER_PADDING_KNOB),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
         serverTransport->serverConn_->transportSettings.paddingModulo = val;
         VLOG(3) << fmt::format(
             "SHORT_HEADER_PADDING_KNOB KnobParam received, setting paddingModulo={}",
@@ -869,24 +979,25 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::ADAPTIVE_LOSS_DETECTION),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
-        auto useAdaptiveLossThresholds = static_cast<bool>(val);
-        server_conn->transportSettings.useAdaptiveLossThresholds =
-            useAdaptiveLossThresholds;
+        auto useAdaptiveLossReorderingThresholds =
+            static_cast<bool>(std::get<uint64_t>(val));
+        server_conn->transportSettings.useAdaptiveLossReorderingThresholds =
+            useAdaptiveLossReorderingThresholds;
         VLOG(3) << fmt::format(
-            "ADAPTIVE_LOSS_DETECTION KnobParam received, UseAdaptiveLossThresholds is now set to {}",
-            useAdaptiveLossThresholds);
+            "ADAPTIVE_LOSS_DETECTION KnobParam received, UseAdaptiveLossReorderingThresholds is now set to {}",
+            useAdaptiveLossReorderingThresholds);
       });
 
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::PACER_EXPERIMENTAL),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val val) {
         CHECK(serverTransport);
         auto server_conn = serverTransport->serverConn_;
         if (server_conn->pacer) {
-          auto enableExperimental = static_cast<bool>(val);
+          auto enableExperimental = static_cast<bool>(std::get<uint64_t>(val));
           server_conn->pacer->setExperimental(enableExperimental);
           VLOG(3) << fmt::format(
               "PACER_EXPERIMENTAL KnobParam received, "
@@ -896,8 +1007,9 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
       });
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::KEEPALIVE_ENABLED),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
         auto server_conn = serverTransport->serverConn_;
         server_conn->transportSettings.enableKeepalive = static_cast<bool>(val);
         VLOG(3) << "KEEPALIVE_ENABLED KnobParam received: "
@@ -905,8 +1017,9 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
       });
   registerTransportKnobParamHandler(
       static_cast<uint64_t>(TransportKnobParamId::REMOVE_FROM_LOSS_BUFFER),
-      [](QuicServerTransport* serverTransport, uint64_t val) {
+      [](QuicServerTransport* serverTransport, TransportKnobParam::Val value) {
         CHECK(serverTransport);
+        auto val = std::get<uint64_t>(value);
         auto server_conn = serverTransport->serverConn_;
         server_conn->transportSettings.removeFromLossBufferOnSpurious =
             static_cast<bool>(val);

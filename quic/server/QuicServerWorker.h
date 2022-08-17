@@ -39,7 +39,8 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
                          public QuicServerTransport::RoutingCallback,
                          public QuicServerTransport::HandshakeFinishedCallback,
                          public ServerConnectionIdRejector,
-                         public folly::EventRecvmsgCallback {
+                         public folly::EventRecvmsgCallback,
+                         public folly::EventRecvmsgMultishotCallback {
  private:
   struct MsgHdr : public folly::EventRecvmsgCallback::MsgHdr {
     static auto constexpr kBuffSize = 1024;
@@ -113,6 +114,40 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
 #endif
   };
 
+  struct MultishotHdr : public folly::EventRecvmsgMultishotCallback::Hdr {
+    MultishotHdr() = delete;
+    ~MultishotHdr() override = default;
+    explicit MultishotHdr(QuicServerWorker* worker) {
+      arg_ = worker;
+      freeFunc_ = MultishotHdr::free;
+      cbFunc_ = MultishotHdr::cb;
+      ::memset(&data_, 0, sizeof(data_));
+      size_t total = 4 + sizeof(struct sockaddr_storage);
+      data_.msg_namelen = sizeof(struct sockaddr_storage);
+#ifdef FOLLY_HAVE_MSG_ERRQUEUE
+      data_.msg_controllen = folly::AsyncUDPSocket::ReadCallback::
+          OnDataAvailableParams::kCmsgSpace;
+      total += folly::AsyncUDPSocket::ReadCallback::OnDataAvailableParams::
+          kCmsgSpace;
+      data_.msg_controllen += total % 16;
+#else
+      data_.msg_namelen += total % 16;
+#endif
+    }
+
+    static void free(folly::EventRecvmsgMultishotCallback::Hdr* m) {
+      delete m;
+    }
+
+    static void cb(
+        folly::EventRecvmsgMultishotCallback::Hdr* h,
+        int res,
+        std::unique_ptr<folly::IOBuf> io_buf) {
+      reinterpret_cast<QuicServerWorker*>(h->arg_)->recvmsgMultishotCallback(
+          reinterpret_cast<MultishotHdr*>(h), res, std::move(io_buf));
+    }
+  };
+
  public:
   using TransportSettingsOverrideFn =
       std::function<folly::Optional<quic::TransportSettings>(
@@ -133,9 +168,11 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
         bool isForwardedData) = 0;
   };
 
+  enum class SetEventCallback { NONE, RECVMSG, RECVMSG_MULTISHOT };
+
   explicit QuicServerWorker(
       std::shared_ptr<WorkerCallback> callback,
-      bool setEventCallback = false);
+      SetEventCallback ec = SetEventCallback::NONE);
 
   ~QuicServerWorker() override;
 
@@ -449,6 +486,10 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
     return ret;
   }
 
+  EventRecvmsgMultishotCallback::Hdr* allocateRecvmsgMultishotData() override {
+    return new MultishotHdr(this);
+  }
+
   /**
    * Adds observer for accept events.
    *
@@ -523,12 +564,20 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
       LongHeaderInvariant& invariant,
       size_t datagramLen);
 
+  void sendVersionNegotiationPacket(
+      const folly::SocketAddress& client,
+      LongHeaderInvariant& invariant);
+
   /**
    * Helper method to extract and log routing info from the given (dest) connId
    */
   std::string logRoutingInfo(const ConnectionId& connId) const;
 
   void eventRecvmsgCallback(MsgHdr* msgHdr, int res);
+  void recvmsgMultishotCallback(
+      MultishotHdr* msgHdr,
+      int res,
+      std::unique_ptr<folly::IOBuf> io_buf);
 
   bool hasTimestamping() {
     return (socket_ && (socket_->getTimestamping() > 0));
@@ -547,8 +596,8 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
   std::unique_ptr<folly::AsyncUDPSocket> socket_;
   folly::SocketOptionMap* socketOptions_{nullptr};
   std::shared_ptr<WorkerCallback> callback_;
-  bool setEventCallback_{false};
-  folly::EventBase* evb_{nullptr};
+  SetEventCallback setEventCallback_{SetEventCallback::NONE};
+  folly::Executor::KeepAlive<folly::EventBase> evb_;
 
   // factories are owned by quic server
   QuicUDPSocketFactory* socketFactory_;

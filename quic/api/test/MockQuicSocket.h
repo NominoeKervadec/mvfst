@@ -10,6 +10,7 @@
 #include <folly/portability/GMock.h>
 
 #include <quic/api/QuicSocket.h>
+#include <quic/dsr/Types.h>
 
 namespace quic {
 
@@ -84,6 +85,11 @@ class MockQuicSocket : public QuicSocket {
   MOCK_METHOD(
       (folly::Expected<FlowControlState, LocalErrorCode>),
       getStreamFlowControl,
+      (StreamId),
+      (const));
+  MOCK_METHOD(
+      (folly::Expected<uint64_t, LocalErrorCode>),
+      getMaxWritableOnStream,
       (StreamId),
       (const));
   MOCK_METHOD(void, unsetAllReadCallbacks, ());
@@ -303,6 +309,8 @@ class MockQuicSocket : public QuicSocket {
 
   MOCK_METHOD(void, setCongestionControl, (CongestionControlType));
 
+  MOCK_METHOD(void, addPacketProcessor, (std::shared_ptr<PacketProcessor>));
+
   ConnectionSetupCallback* setupCb_{nullptr};
   ConnectionCallback* connCb_{nullptr};
 
@@ -339,5 +347,21 @@ class MockQuicSocket : public QuicSocket {
       getSocketObserverContainer,
       (),
       (const));
+  MOCK_METHOD(
+      (folly::Expected<StreamGroupId, LocalErrorCode>),
+      createBidirectionalStreamGroup,
+      ());
+  MOCK_METHOD(
+      (folly::Expected<StreamGroupId, LocalErrorCode>),
+      createUnidirectionalStreamGroup,
+      ());
+  MOCK_METHOD(
+      (folly::Expected<StreamId, LocalErrorCode>),
+      createBidirectionalStreamInGroup,
+      (StreamGroupId));
+  MOCK_METHOD(
+      (folly::Expected<StreamId, LocalErrorCode>),
+      createUnidirectionalStreamInGroup,
+      (StreamGroupId));
 };
 } // namespace quic

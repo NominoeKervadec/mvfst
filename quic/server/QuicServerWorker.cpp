@@ -46,9 +46,9 @@ std::atomic_int globalUnfinishedHandshakes{0};
 
 QuicServerWorker::QuicServerWorker(
     std::shared_ptr<QuicServerWorker::WorkerCallback> callback,
-    bool setEventCallback)
+    SetEventCallback ec)
     : callback_(callback),
-      setEventCallback_(setEventCallback),
+      setEventCallback_(ec),
       takeoverPktHandler_(this),
       observerList_(this) {
   ccpReader_ = std::make_unique<CCPReader>();
@@ -57,13 +57,13 @@ QuicServerWorker::QuicServerWorker(
 }
 
 folly::EventBase* QuicServerWorker::getEventBase() const {
-  return evb_;
+  return evb_.get();
 }
 
 void QuicServerWorker::setSocket(
     std::unique_ptr<folly::AsyncUDPSocket> socket) {
   socket_ = std::move(socket);
-  evb_ = socket_->getEventBase();
+  evb_ = folly::Executor::KeepAlive(socket_->getEventBase());
 }
 
 void QuicServerWorker::bind(
@@ -71,9 +71,16 @@ void QuicServerWorker::bind(
     folly::AsyncUDPSocket::BindOptions bindOptions) {
   DCHECK(!supportedVersions_.empty());
   CHECK(socket_);
-  if (setEventCallback_) {
-    socket_->setEventCallback(this);
-  }
+  switch (setEventCallback_) {
+    case SetEventCallback::NONE:
+      break;
+    case SetEventCallback::RECVMSG:
+      socket_->setEventCallback(this);
+      break;
+    case SetEventCallback::RECVMSG_MULTISHOT:
+      socket_->setRecvmsgMultishotCallback(this);
+      break;
+  };
   // TODO this totally doesn't work, we can't apply socket options before
   // bind, since bind creates the fd.
   if (socketOptions_) {
@@ -162,7 +169,7 @@ void QuicServerWorker::start() {
   CHECK(socket_);
   if (!pacingTimer_) {
     pacingTimer_ = TimerHighRes::newTimer(
-        evb_, transportSettings_.pacingTimerTickInterval);
+        evb_.get(), transportSettings_.pacingTimerTickInterval);
   }
   socket_->resumeRead(this);
   VLOG(10) << fmt::format(
@@ -255,6 +262,20 @@ bool QuicServerWorker::maybeSendVersionNegotiationPacketOrDrop(
   return false;
 }
 
+void QuicServerWorker::sendVersionNegotiationPacket(
+    const folly::SocketAddress& client,
+    LongHeaderInvariant& invariant) {
+  VersionNegotiationPacketBuilder builder(
+      invariant.dstConnId, invariant.srcConnId, supportedVersions_);
+  auto versionNegotiationPacket = std::move(builder).buildPacket();
+  VLOG(4) << "Version negotiation sent to client=" << client;
+  auto len = versionNegotiationPacket.second->computeChainDataLength();
+  QUIC_STATS(statsCallback_, onWrite, len);
+  QUIC_STATS(statsCallback_, onPacketProcessed);
+  QUIC_STATS(statsCallback_, onPacketSent);
+  socket_->write(client, versionNegotiationPacket.second);
+}
+
 void QuicServerWorker::onDataAvailable(
     const folly::SocketAddress& client,
     size_t len,
@@ -316,26 +337,24 @@ void QuicServerWorker::onDataAvailable(
     size_t remaining = len;
     size_t offset = 0;
     while (remaining) {
-      if (static_cast<int>(remaining) > params.gro) {
-        auto tmp = data->cloneOne();
-        // start at offset
-        tmp->trimStart(offset);
-        // the actual len is len - offset now
-        // leave params.gro_ bytes
-        tmp->trimEnd(len - offset - params.gro);
-        DCHECK_EQ(tmp->length(), params.gro);
-
-        offset += params.gro;
-        remaining -= params.gro;
-        handleNetworkData(client, std::move(tmp), packetReceiveTime);
-      } else {
+      if (static_cast<int>(remaining) <= params.gro) {
         // do not clone the last packet
         // start at offset, use all the remaining data
         data->trimStart(offset);
         DCHECK_EQ(data->length(), remaining);
-        remaining = 0;
         handleNetworkData(client, std::move(data), packetReceiveTime);
+        break;
       }
+      auto tmp = data->cloneOne();
+      // start at offset
+      tmp->trimStart(offset);
+      // the actual len is len - offset now
+      // leave params.gro_ bytes
+      tmp->trimEnd(len - offset - params.gro);
+      DCHECK_EQ(tmp->length(), params.gro);
+      offset += params.gro;
+      remaining -= params.gro;
+      handleNetworkData(client, std::move(tmp), packetReceiveTime);
     }
   }
 }
@@ -464,6 +483,49 @@ void QuicServerWorker::handleNetworkData(
     // Drop the packet.
     QUIC_STATS(statsCallback_, onPacketDropped, PacketDropReason::PARSE_ERROR);
     VLOG(6) << "Failed to parse packet header " << ex.what();
+  }
+}
+
+void QuicServerWorker::recvmsgMultishotCallback(
+    MultishotHdr* hdr,
+    int res,
+    std::unique_ptr<folly::IOBuf> io_buf) {
+  if (res < 0) {
+    return;
+  }
+
+  folly::EventRecvmsgMultishotCallback::ParsedRecvMsgMultishot p;
+  if (!folly::EventRecvmsgMultishotCallback::parseRecvmsgMultishot(
+          io_buf->coalesce(), hdr->data_, p)) {
+    return;
+  }
+
+  auto bytesRead = p.payload.size();
+  if (bytesRead > 0) {
+    OnDataAvailableParams params;
+#ifdef FOLLY_HAVE_MSG_ERRQUEUE
+    if (p.control.size()) {
+      // hacky
+      struct msghdr msg;
+      msg.msg_controllen = p.control.size();
+      msg.msg_control = (void*)p.control.data();
+      folly::AsyncUDPSocket::fromMsg(params, msg);
+    }
+#endif
+    bool truncated = false;
+    if ((size_t)bytesRead != p.realPayloadLength) {
+      truncated = true;
+    }
+
+    folly::SocketAddress addr;
+    addr.setFromSockaddr(
+        reinterpret_cast<sockaddr const*>(p.name.data()), p.name.size());
+    io_buf->trimStart(p.payload.data() - io_buf->data());
+    readBuffer_ = std::move(io_buf);
+
+    // onDataAvailable will add bytesRead back
+    readBuffer_->trimEnd(bytesRead);
+    onDataAvailable(addr, bytesRead, truncated, params);
   }
 }
 
@@ -625,8 +687,12 @@ void QuicServerWorker::dispatchPacketData(
 
         // This could be a new connection, add it in the map
         // verify that the initial packet is at least min initial bytes
-        // to avoid amplification attacks.
-        if (networkData.totalData < kMinInitialPacketSize) {
+        // to avoid amplification attacks. Also check CID sizes.
+        if (routingData.isInitial &&
+            (networkData.totalData < kMinInitialPacketSize ||
+             routingData.destinationConnId.size() <
+                 kMinInitialDestinationConnIdLength ||
+             routingData.destinationConnId.size() > kMaxConnectionIdSize)) {
           // Don't even attempt to forward the packet, just drop it.
           VLOG(3) << "Dropping small initial packet from client=" << client;
           QUIC_STATS(
@@ -791,12 +857,17 @@ void QuicServerWorker::dispatchPacketData(
     return;
   }
   if (cannotMakeTransport) {
-    VLOG(3)
-        << "Dropping packet due to transport factory did not make transport";
+    // Act as though we received a junk Initial.
+    CHECK(routingData.sourceConnId.has_value());
+    LongHeaderInvariant inv{
+        QuicVersion::MVFST_INVALID,
+        routingData.sourceConnId.value(),
+        routingData.destinationConnId};
     QUIC_STATS(
         statsCallback_,
         onPacketDropped,
         PacketDropReason::CANNOT_MAKE_TRANSPORT);
+    sendVersionNegotiationPacket(client, inv);
     return;
   }
   if (!connIdAlgo_->canParse(routingData.destinationConnId)) {
@@ -819,10 +890,13 @@ void QuicServerWorker::dispatchPacketData(
     return;
   }
   if (connIdParam->hostId != hostId_) {
+#if !defined(_MSC_VER) // This condition should be removed once we
+                       // transition to folly XLOG.
     VLOG_EVERY_N(2, 100) << fmt::format(
         "Dropping packet routed to wrong host, from client={}, routingInfo={},",
         client.describe(),
         logRoutingInfo(routingData.destinationConnId));
+#endif
     QUIC_STATS(
         statsCallback_,
         onPacketDropped,
@@ -1342,6 +1416,7 @@ void QuicServerWorker::shutdownAllConnections(LocalErrorCode error) {
   socket_.reset();
   takeoverCB_.reset();
   pacingTimer_.reset();
+  evb_.reset();
 }
 
 QuicServerWorker::~QuicServerWorker() {

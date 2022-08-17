@@ -376,7 +376,11 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
  private:
   QuicServer();
 
-  static std::unique_ptr<folly::EventBaseBackendBase> getEventBaseBackend();
+  struct EventBaseBackendDetails {
+    std::unique_ptr<folly::EventBaseBackendBase> (*factory)();
+    bool supportsRecvmsgMultishot = false;
+  };
+  static EventBaseBackendDetails getEventBaseBackendDetails();
 
   // helper function to initialize workers
   void initializeWorkers(
@@ -402,6 +406,7 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
        QuicVersion::MVFST_EXPERIMENTAL3,
        QuicVersion::MVFST_ALIAS,
        QuicVersion::QUIC_V1,
+       QuicVersion::QUIC_V1_ALIAS,
        QuicVersion::QUIC_DRAFT}};
 
   bool isUsingCCP();
@@ -475,6 +480,10 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   // in case there are multiple concurrent instances (e.g. when proxygen is
   // migrating connections and there are two concurrent instances of proxygen)
   uint64_t ccpId_{0};
+
+  // set by getEventBaseBackend if multishot callback is
+  // supprted
+  bool backendSupportsMultishotCallback_{false};
 };
 
 } // namespace quic

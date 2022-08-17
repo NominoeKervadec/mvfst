@@ -32,16 +32,42 @@ folly::Optional<TransportKnobParams> parseTransportKnobs(
     const std::string& serializedParams) {
   TransportKnobParams knobParams;
   try {
-    folly::dynamic params = folly::parseJson(serializedParams);
+    // leave numbers as strings so that we can use uint64_t number space
+    // (JSON only supports int64; numbers larger than this will trigger throw)
+    folly::json::serialization_opts opts;
+    opts.parse_numbers_as_strings = true;
+    folly::dynamic params = folly::parseJson(serializedParams, opts);
     for (const auto& id : params.keys()) {
       auto paramId = folly::to<uint64_t>(id.asInt());
       auto val = params[id];
       switch (val.type()) {
         case folly::dynamic::Type::BOOL:
-        case folly::dynamic::Type::INT64:
           knobParams.push_back({paramId, folly::to<uint64_t>(val.asInt())});
           continue;
         case folly::dynamic::Type::STRING: {
+          /*
+           * try to parse as an integer first, unless known to be string knob
+           * we parse manually to enable us to support uint64_t
+           */
+          switch (paramId) {
+            case TransportKnobParamId::MAX_PACING_RATE_KNOB_SEQUENCED:
+              knobParams.push_back({paramId, val.asString()});
+              continue; // triggers next loop iteration
+            case TransportKnobParamId::AUTO_BACKGROUND_MODE:
+            case TransportKnobParamId::CC_ALGORITHM_KNOB:
+            case TransportKnobParamId::STARTUP_RTT_FACTOR_KNOB:
+            case TransportKnobParamId::DEFAULT_RTT_FACTOR_KNOB:
+            case TransportKnobParamId::NO_OP:
+              break;
+            default:
+              if (const auto expectAsInt =
+                      folly::tryTo<uint64_t>(val.asString())) {
+                knobParams.push_back({paramId, expectAsInt.value()});
+                continue; // triggers next loop iteration
+              }
+              return folly::none; // error parsing integer parameter
+          }
+
           /*
            * set cc algorithm
            * expected format: string, all lower case, name of cc algorithm

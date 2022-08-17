@@ -494,7 +494,8 @@ void QuicClientTransport::processPacketData(
                  << " len=" << frame.data->computeChainDataLength()
                  << " fin=" << frame.fin << " packetNum=" << packetNum << " "
                  << *this;
-        auto stream = conn_->streamManager->getStream(frame.streamId);
+        auto stream = conn_->streamManager->getStream(
+            frame.streamId, frame.streamGroupId);
         pktHasRetransmittableData = true;
         if (!stream) {
           VLOG(10) << "Could not find stream=" << frame.streamId << " "
@@ -997,6 +998,7 @@ void QuicClientTransport::startCryptoHandshake() {
   setD6DRaiseTimeoutTransportParameter();
   setD6DProbeTimeoutTransportParameter();
   setSupportedExtensionTransportParameters();
+  maybeEnableStreamGroups();
 
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
       conn_->originalVersion.value(),
@@ -1646,35 +1648,6 @@ void QuicClientTransport::setSelfOwning() {
   selfOwning_ = shared_from_this();
 }
 
-bool QuicClientTransport::setCustomTransportParameter(
-    std::unique_ptr<CustomTransportParameter> customParam) {
-  // check that the parameter id is in the "private parameter" range, as
-  // described by the spec.
-  if (static_cast<uint16_t>(customParam->getParameterId()) <
-      kCustomTransportParameterThreshold) {
-    LOG(ERROR) << "invalid parameter id";
-    return false;
-  }
-
-  // check to see that we haven't already added in a parameter with the
-  // specified parameter id
-  auto it = std::find_if(
-      customTransportParameters_.begin(),
-      customTransportParameters_.end(),
-      [&customParam](const TransportParameter& param) {
-        return param.parameter == customParam->getParameterId();
-      });
-
-  // if a match has been found, we return failure
-  if (it != customTransportParameters_.end()) {
-    LOG(ERROR) << "transport parameter already present";
-    return false;
-  }
-
-  customTransportParameters_.push_back(customParam->encode());
-  return true;
-}
-
 void QuicClientTransport::setD6DBasePMTUTransportParameter() {
   if (!conn_->transportSettings.d6dConfig.enabled) {
     return;
@@ -1693,7 +1666,8 @@ void QuicClientTransport::setD6DBasePMTUTransportParameter() {
   auto basePMTUCustomParam = std::make_unique<CustomIntegralTransportParameter>(
       kD6DBasePMTUParameterId, basePMTUSetting);
 
-  if (!setCustomTransportParameter(std::move(basePMTUCustomParam))) {
+  if (!setCustomTransportParameter(
+          std::move(basePMTUCustomParam), customTransportParameters_)) {
     LOG(ERROR) << "failed to set D6D base PMTU transport parameter";
   }
 }
@@ -1716,7 +1690,8 @@ void QuicClientTransport::setD6DRaiseTimeoutTransportParameter() {
       std::make_unique<CustomIntegralTransportParameter>(
           kD6DRaiseTimeoutParameterId, raiseTimeoutSetting.count());
 
-  if (!setCustomTransportParameter(std::move(raiseTimeoutCustomParam))) {
+  if (!setCustomTransportParameter(
+          std::move(raiseTimeoutCustomParam), customTransportParameters_)) {
     LOG(ERROR) << "failed to set D6D raise timeout transport parameter";
   }
 }
@@ -1739,7 +1714,8 @@ void QuicClientTransport::setD6DProbeTimeoutTransportParameter() {
       std::make_unique<CustomIntegralTransportParameter>(
           kD6DProbeTimeoutParameterId, probeTimeoutSetting.count());
 
-  if (!setCustomTransportParameter(std::move(probeTimeoutCustomParam))) {
+  if (!setCustomTransportParameter(
+          std::move(probeTimeoutCustomParam), customTransportParameters_)) {
     LOG(ERROR) << "failed to set D6D probe timeout transport parameter";
   }
 }
@@ -1857,6 +1833,22 @@ void QuicClientTransport::maybeSendTransportKnobs() {
       }
     }
     transportKnobsSent_ = true;
+  }
+}
+
+void QuicClientTransport::maybeEnableStreamGroups() {
+  if (conn_->transportSettings.maxStreamGroupsAdvertized == 0) {
+    return;
+  }
+
+  auto streamGroupsEnabledParam =
+      std::make_unique<CustomIntegralTransportParameter>(
+          kStreamGroupsEnabledCustomParamId,
+          conn_->transportSettings.maxStreamGroupsAdvertized);
+
+  if (!setCustomTransportParameter(
+          std::move(streamGroupsEnabledParam), customTransportParameters_)) {
+    LOG(ERROR) << "failed to set stream groups enabled transport parameter";
   }
 }
 

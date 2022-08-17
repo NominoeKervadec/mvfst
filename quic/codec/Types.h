@@ -28,6 +28,7 @@
 namespace quic {
 
 using StreamId = uint64_t;
+using StreamGroupId = uint64_t;
 using PacketNum = uint64_t;
 
 enum class PacketNumberSpace : uint8_t {
@@ -328,6 +329,7 @@ struct ReadNewTokenFrame {
 */
 struct WriteStreamFrame {
   StreamId streamId;
+  folly::Optional<StreamGroupId> streamGroupId;
   uint64_t offset;
   uint64_t len;
   bool fin;
@@ -341,8 +343,10 @@ struct WriteStreamFrame {
       uint64_t offsetIn,
       uint64_t lenIn,
       bool finIn,
-      bool fromBufMetaIn = false)
+      bool fromBufMetaIn = false,
+      folly::Optional<StreamGroupId> streamGroupIdIn = folly::none)
       : streamId(streamIdIn),
+        streamGroupId(streamGroupIdIn),
         offset(offsetIn),
         len(lenIn),
         fin(finIn),
@@ -350,7 +354,8 @@ struct WriteStreamFrame {
 
   bool operator==(const WriteStreamFrame& rhs) const {
     return streamId == rhs.streamId && offset == rhs.offset && len == rhs.len &&
-        fin == rhs.fin && fromBufMeta == rhs.fromBufMeta;
+        fin == rhs.fin && fromBufMeta == rhs.fromBufMeta &&
+        streamGroupId == rhs.streamGroupId;
   }
 };
 
@@ -359,6 +364,7 @@ struct WriteStreamFrame {
  */
 struct ReadStreamFrame {
   StreamId streamId;
+  folly::Optional<StreamGroupId> streamGroupId;
   uint64_t offset;
   Buf data;
   bool fin;
@@ -367,14 +373,21 @@ struct ReadStreamFrame {
       StreamId streamIdIn,
       uint64_t offsetIn,
       Buf dataIn,
-      bool finIn)
+      bool finIn,
+      folly::Optional<StreamGroupId> streamGroupIdIn = folly::none)
       : streamId(streamIdIn),
+        streamGroupId(streamGroupIdIn),
         offset(offsetIn),
         data(std::move(dataIn)),
         fin(finIn) {}
 
-  ReadStreamFrame(StreamId streamIdIn, uint64_t offsetIn, bool finIn)
+  ReadStreamFrame(
+      StreamId streamIdIn,
+      uint64_t offsetIn,
+      bool finIn,
+      folly::Optional<StreamGroupId> streamGroupIdIn = folly::none)
       : streamId(streamIdIn),
+        streamGroupId(streamGroupIdIn),
         offset(offsetIn),
         data(folly::IOBuf::create(0)),
         fin(finIn) {}
@@ -387,6 +400,7 @@ struct ReadStreamFrame {
       data = other.data->clone();
     }
     fin = other.fin;
+    streamGroupId = other.streamGroupId;
   }
 
   ReadStreamFrame(ReadStreamFrame&& other) noexcept {
@@ -394,6 +408,7 @@ struct ReadStreamFrame {
     offset = other.offset;
     data = std::move(other.data);
     fin = other.fin;
+    streamGroupId = other.streamGroupId;
   }
 
   ReadStreamFrame& operator=(const ReadStreamFrame& other) {
@@ -403,6 +418,7 @@ struct ReadStreamFrame {
       data = other.data->clone();
     }
     fin = other.fin;
+    streamGroupId = other.streamGroupId;
     return *this;
   }
 
@@ -411,13 +427,15 @@ struct ReadStreamFrame {
     offset = other.offset;
     data = std::move(other.data);
     fin = other.fin;
+    streamGroupId = other.streamGroupId;
     return *this;
   }
 
   bool operator==(const ReadStreamFrame& other) const {
     folly::IOBufEqualTo eq;
     return streamId == other.streamId && offset == other.offset &&
-        fin == other.fin && eq(data, other.data);
+        fin == other.fin && eq(data, other.data) &&
+        streamGroupId == other.streamGroupId;
   }
 };
 
@@ -985,6 +1003,7 @@ struct StreamTypeField {
   struct Builder {
    public:
     Builder() : field_(static_cast<uint8_t>(FrameType::STREAM)) {}
+    Builder& switchToStreamGroups();
     Builder& setFin();
     Builder& setOffset();
     Builder& setLength();

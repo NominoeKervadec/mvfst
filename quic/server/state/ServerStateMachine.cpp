@@ -91,17 +91,11 @@ void recoverOrResetCongestionAndRttState(
 }
 
 void maybeSetExperimentalSettings(QuicServerConnectionState& conn) {
+  // no-op versions
   if (conn.version == QuicVersion::MVFST_EXPERIMENTAL) {
-    // MVFST_EXPERIMENTAL currently enables experimental congestion control
-    // and experimental pacer. (here and in the client transport)
-    if (conn.congestionController) {
-      conn.congestionController->setExperimental(true);
-    }
-    if (conn.pacer) {
-      conn.pacer->setExperimental(true);
-    }
-  } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL3) {
     conn.transportSettings.enableWritableBytesLimit = true;
+  } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL2) {
+  } else if (conn.version == QuicVersion::MVFST_EXPERIMENTAL3) {
   }
 }
 } // namespace
@@ -159,9 +153,13 @@ void processClientInitialParams(
       TransportParameterId::max_ack_delay, clientParams.parameters);
   auto maxDatagramFrameSize = getIntegerParameter(
       TransportParameterId::max_datagram_frame_size, clientParams.parameters);
+  auto peerMaxStreamGroupsAdvertized = getIntegerParameter(
+      static_cast<TransportParameterId>(kStreamGroupsEnabledCustomParamId),
+      clientParams.parameters);
 
   if (conn.version == QuicVersion::QUIC_DRAFT ||
-      conn.version == QuicVersion::QUIC_V1) {
+      conn.version == QuicVersion::QUIC_V1 ||
+      conn.version == QuicVersion::QUIC_V1_ALIAS) {
     auto initialSourceConnId = getConnIdParameter(
         TransportParameterId::initial_source_connection_id,
         clientParams.parameters);
@@ -326,6 +324,10 @@ void processClientInitialParams(
                    << *d6dProbeTimeout;
       }
     }
+  }
+
+  if (peerMaxStreamGroupsAdvertized) {
+    conn.peerMaxStreamGroupsAdvertized = *peerMaxStreamGroupsAdvertized;
   }
 }
 
@@ -1076,7 +1078,8 @@ void onServerReadDataFromOpen(
                    << " fin=" << frame.fin << " " << conn;
           pktHasRetransmittableData = true;
           isNonProbingPacket = true;
-          auto stream = conn.streamManager->getStream(frame.streamId);
+          auto stream = conn.streamManager->getStream(
+              frame.streamId, frame.streamGroupId);
           // Ignore data from closed streams that we don't have the
           // state for any more.
           if (stream) {
@@ -1480,6 +1483,19 @@ std::vector<TransportParameter> setSupportedExtensionTransportParameters(
             conn.datagramState.maxReadFrameSize);
     customTransportParams.push_back(maxDatagramFrameSize->encode());
   }
+
+  if (conn.transportSettings.maxStreamGroupsAdvertized > 0) {
+    auto streamGroupsEnabledParam =
+        std::make_unique<CustomIntegralTransportParameter>(
+            kStreamGroupsEnabledCustomParamId,
+            conn.transportSettings.maxStreamGroupsAdvertized);
+
+    if (!setCustomTransportParameter(
+            std::move(streamGroupsEnabledParam), customTransportParams)) {
+      LOG(ERROR) << "failed to set stream groups enabled transport parameter";
+    }
+  }
+
   return customTransportParams;
 }
 } // namespace quic

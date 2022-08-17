@@ -128,8 +128,13 @@ void processServerInitialParams(
       serverParams.parameters);
   auto maxDatagramFrameSize = getIntegerParameter(
       TransportParameterId::max_datagram_frame_size, serverParams.parameters);
+  auto peerMaxStreamGroupsAdvertized = getIntegerParameter(
+      static_cast<TransportParameterId>(kStreamGroupsEnabledCustomParamId),
+      serverParams.parameters);
+
   if (conn.version == QuicVersion::QUIC_DRAFT ||
-      conn.version == QuicVersion::QUIC_V1) {
+      conn.version == QuicVersion::QUIC_V1 ||
+      conn.version == QuicVersion::QUIC_V1_ALIAS) {
     auto initialSourceConnId = getConnIdParameter(
         TransportParameterId::initial_source_connection_id,
         serverParams.parameters);
@@ -222,6 +227,10 @@ void processServerInitialParams(
           TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
     }
     conn.datagramState.maxWriteFrameSize = maxDatagramFrameSize.value();
+  }
+
+  if (peerMaxStreamGroupsAdvertized) {
+    conn.peerMaxStreamGroupsAdvertized = *peerMaxStreamGroupsAdvertized;
   }
 }
 

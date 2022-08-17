@@ -67,7 +67,7 @@ AckEvent processAckFrame(
                  .build();
 
   // temporary storage to enable packets to be processed in sent order
-  SmallVec<OutstandingPacketWithHandlerContext, 50, uint16_t>
+  SmallVec<OutstandingPacketWithHandlerContext, 50, uint64_t>
       packetsWithHandlerContext;
 
   auto currentPacketIt = getLastOutstandingPacketIncludingLost(conn, pnSpace);
@@ -141,13 +141,15 @@ AckEvent processAckFrame(
       if (rPacketIt->declaredLost) {
         CHECK_GT(conn.outstandings.declaredLostCount, 0);
         conn.lossState.totalPacketsSpuriouslyMarkedLost++;
-        if (conn.transportSettings.useAdaptiveLossThresholds) {
+        if (conn.transportSettings.useAdaptiveLossReorderingThresholds) {
           if (rPacketIt->lossReorderDistance.hasValue() &&
               rPacketIt->lossReorderDistance.value() >
                   conn.lossState.reorderingThreshold) {
             conn.lossState.reorderingThreshold =
                 rPacketIt->lossReorderDistance.value();
           }
+        }
+        if (conn.transportSettings.useAdaptiveLossTimeThresholds) {
           if (rPacketIt->lossTimeoutDividend.hasValue() &&
               rPacketIt->lossTimeoutDividend.value() >
                   conn.transportSettings.timeReorderingThreshDividend) {
@@ -278,6 +280,7 @@ AckEvent processAckFrame(
         }
         conn.lossState.lastAckedTime = ackReceiveTime;
         conn.lossState.adjustedLastAckedTime = ackReceiveTime - frame.ackDelay;
+        ack.totalBytesAcked = conn.lossState.totalBytesAcked;
       }
 
       {
@@ -481,6 +484,9 @@ AckEvent processAckFrame(
       }
     }
     conn.congestionController->onPacketAckOrLoss(&ack, lossEvent.get_pointer());
+    for (auto& packetProcessor : conn.packetProcessors) {
+      packetProcessor->onPacketAck(&ack);
+    }
     ack.ccState = conn.congestionController->getState();
   }
   clearOldOutstandingPackets(conn, ackReceiveTime, pnSpace);

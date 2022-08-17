@@ -266,6 +266,11 @@ struct QuicStreamState : public QuicStreamLike {
 
   QuicStreamState(StreamId id, QuicConnectionStateBase& conn);
 
+  QuicStreamState(
+      StreamId idIn,
+      const folly::Optional<StreamGroupId>& groupIdIn,
+      QuicConnectionStateBase& connIn);
+
   QuicStreamState(QuicStreamState&&) = default;
 
   /**
@@ -273,7 +278,10 @@ struct QuicStreamState : public QuicStreamLike {
    * QuicConnectionStateBase.
    */
   QuicStreamState(QuicConnectionStateBase& connIn, QuicStreamState&& other)
-      : QuicStreamLike(std::move(other)), conn(connIn), id(other.id) {
+      : QuicStreamLike(std::move(other)),
+        conn(connIn),
+        id(other.id),
+        groupId(other.groupId) {
     // QuicStreamState fields
     finalWriteOffset = other.finalWriteOffset;
     flowControlState = other.flowControlState;
@@ -297,6 +305,9 @@ struct QuicStreamState : public QuicStreamLike {
 
   // Stream id of the connection.
   StreamId id;
+
+  // ID of the group the stream belongs to.
+  folly::Optional<StreamGroupId> groupId;
 
   // Write side eof offset. This represents only the final FIN offset.
   folly::Optional<uint64_t> finalWriteOffset;
@@ -366,6 +377,7 @@ struct QuicStreamState : public QuicStreamLike {
   // needs to have writeBuffer, or it has EOF to send.
   bool hasWritableData() const {
     if (!writeBuffer.empty()) {
+      CHECK_GE(flowControlState.peerAdvertisedMaxOffset, currentWriteOffset);
       return flowControlState.peerAdvertisedMaxOffset - currentWriteOffset > 0;
     }
     if (finalWriteOffset) {
@@ -389,6 +401,7 @@ struct QuicStreamState : public QuicStreamLike {
       return false;
     }
     if (writeBufMeta.length > 0) {
+      CHECK_GE(flowControlState.peerAdvertisedMaxOffset, writeBufMeta.offset);
       return flowControlState.peerAdvertisedMaxOffset - writeBufMeta.offset > 0;
     }
     if (finalWriteOffset) {
@@ -403,6 +416,10 @@ struct QuicStreamState : public QuicStreamLike {
     }
     return currentWriteOffset > *finalWriteOffset ||
         writeBufMeta.offset > *finalWriteOffset;
+  }
+
+  FOLLY_NODISCARD bool hasLoss() const {
+    return !lossBuffer.empty() || !lossBufMetas.empty();
   }
 
   FOLLY_NODISCARD uint64_t nextOffsetToWrite() const {
@@ -454,8 +471,8 @@ struct QuicStreamState : public QuicStreamLike {
         lossBufMetas.begin(),
         lossBufMetas.end(),
         bufMeta.offset,
-        [](auto offset, const auto& bufMeta) {
-          return offset < bufMeta.offset;
+        [](auto offset, const auto& wBufMeta) {
+          return offset < wBufMeta.offset;
         });
     if (!lossBufMetas.empty() && lossItr != lossBufMetas.begin() &&
         std::prev(lossItr)->offset + std::prev(lossItr)->length ==

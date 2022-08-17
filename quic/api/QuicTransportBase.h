@@ -103,6 +103,9 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   folly::Expected<QuicSocket::FlowControlState, LocalErrorCode>
   getStreamFlowControl(StreamId id) const override;
 
+  folly::Expected<uint64_t, LocalErrorCode> getMaxWritableOnStream(
+      StreamId id) const override;
+
   folly::Expected<folly::Unit, LocalErrorCode> setConnectionFlowControlWindow(
       uint64_t windowSize) override;
 
@@ -153,6 +156,14 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
       bool replaySafe = true) override;
   folly::Expected<StreamId, LocalErrorCode> createUnidirectionalStream(
       bool replaySafe = true) override;
+  folly::Expected<StreamGroupId, LocalErrorCode>
+  createBidirectionalStreamGroup() override;
+  folly::Expected<StreamGroupId, LocalErrorCode>
+  createUnidirectionalStreamGroup() override;
+  folly::Expected<StreamId, LocalErrorCode> createBidirectionalStreamInGroup(
+      StreamGroupId groupId) override;
+  folly::Expected<StreamId, LocalErrorCode> createUnidirectionalStreamInGroup(
+      StreamGroupId groupId) override;
   uint64_t getNumOpenableBidirectionalStreams() const override;
   uint64_t getNumOpenableUnidirectionalStreams() const override;
   bool isClientStream(StreamId stream) noexcept override;
@@ -627,6 +638,9 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   // If you don't set it, the default is Cubic
   void setCongestionControl(CongestionControlType type) override;
 
+  void addPacketProcessor(
+      std::shared_ptr<PacketProcessor> packetProcessor) override;
+
   void describe(std::ostream& os) const;
 
   void setLogger(std::shared_ptr<Logger> logger) {
@@ -701,6 +715,7 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   void handleAckEventCallbacks();
   void handleCancelByteEventCallbacks();
   void handleNewStreamCallbacks(std::vector<StreamId>& newPeerStreams);
+  void handleNewGroupedStreamCallbacks(std::vector<StreamId>& newPeerStreams);
   void handleDeliveryCallbacks();
   void handleStreamFlowControlUpdatedCallbacks(
       std::vector<StreamId>& streamStorage);
@@ -738,7 +753,8 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
       StreamId id,
       PeekCallback* cb) noexcept;
   folly::Expected<StreamId, LocalErrorCode> createStreamInternal(
-      bool bidirectional);
+      bool bidirectional,
+      const folly::Optional<StreamGroupId>& streamGroupId = folly::none);
 
   /**
    * Helper function - if given error is not set, returns a generic app error.
@@ -775,8 +791,8 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
    */
   void pacedWriteDataToSocket(bool fromTimer);
 
-  uint64_t maxWritableOnStream(const QuicStreamState&);
-  uint64_t maxWritableOnConn();
+  uint64_t maxWritableOnStream(const QuicStreamState&) const;
+  uint64_t maxWritableOnConn() const;
 
   void lossTimeoutExpired() noexcept;
   void ackTimeoutExpired() noexcept;
@@ -924,6 +940,18 @@ class QuicTransportBase : public QuicSocket, QuicStreamPrioritiesObserver {
   // (value >= threshold), the connection is considered to be in backround mode.
   folly::Optional<PriorityLevel> backgroundPriorityThreshold_;
   folly::Optional<float> backgroundUtilizationFactor_;
+
+ private:
+  /**
+   * Helper funtions to handle new streams.
+   */
+  void handleNewStreams(std::vector<StreamId>& newPeerStreams);
+  void handleNewGroupedStreams(std::vector<StreamId>& newPeerStreams);
+
+  /**
+   * Helper to log new stream event to observer.
+   */
+  void logStreamOpenEvent(StreamId streamId);
 };
 
 std::ostream& operator<<(std::ostream& os, const QuicTransportBase& qt);

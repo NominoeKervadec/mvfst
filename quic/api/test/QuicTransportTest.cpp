@@ -75,7 +75,7 @@ class QuicTransportTest : public Test {
         &evb_, std::move(sock), &connSetupCallback_, &connCallback_));
     // Set the write handshake state to tell the client that the handshake has
     // a cipher.
-    auto aead = std::make_unique<NiceMock<MockAead>>();
+    auto aead = createNoOpAead();
     aead_ = aead.get();
     EXPECT_CALL(*aead_, _inplaceEncrypt(_, _, _))
         .WillRepeatedly(
@@ -83,8 +83,11 @@ class QuicTransportTest : public Test {
     EXPECT_CALL(*aead_, _decrypt(_, _, _))
         .WillRepeatedly(
             Invoke([&](auto& buf, auto, auto) { return buf->clone(); }));
-    headerCipher_ = test::createNoOpHeaderCipher();
     transport_->getConnectionState().oneRttWriteCipher = std::move(aead);
+    auto tempHeaderCipher = test::createNoOpHeaderCipher();
+    tempHeaderCipher->setDefaultKey();
+    transport_->getConnectionState().oneRttWriteHeaderCipher =
+        std::move(tempHeaderCipher);
     transport_->getConnectionState()
         .flowControlState.peerAdvertisedInitialMaxStreamOffsetBidiLocal =
         kDefaultStreamWindowSize;
@@ -120,7 +123,6 @@ class QuicTransportTest : public Test {
   NiceMock<MockConnectionCallback> connCallback_;
   NiceMock<MockWriteCallback> writeCallback_;
   MockAead* aead_;
-  std::unique_ptr<PacketNumberCipher> headerCipher_;
   std::shared_ptr<TestQuicTransport> transport_;
 };
 
@@ -1615,7 +1617,7 @@ TEST_F(QuicTransportTest, WriteSmall) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
 
@@ -1650,7 +1652,7 @@ TEST_F(QuicTransportTest, WriteLarge) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(NumFullPackets + 1, conn.outstandings.packets.size());
@@ -1706,7 +1708,7 @@ TEST_F(QuicTransportTest, WriteMultipleStreams) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   verifyCorrectness(conn, 0, s1, *buf);
@@ -1767,7 +1769,7 @@ TEST_F(QuicTransportTest, WriteFlowControl) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   verifyCorrectness(conn, 100, streamId, *buf1, false, false);
@@ -1783,7 +1785,7 @@ TEST_F(QuicTransportTest, WriteFlowControl) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   auto buf2 = buf->clone();
@@ -1815,7 +1817,7 @@ TEST_F(QuicTransportTest, WriteFlowControl) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
 
@@ -1828,7 +1830,7 @@ TEST_F(QuicTransportTest, WriteFlowControl) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   verifyCorrectness(conn, 100, streamId, *buf, false, false);
@@ -1880,7 +1882,7 @@ TEST_F(QuicTransportTest, WriteFin) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   verifyCorrectness(conn, 0, stream, *buf, true);
@@ -1908,7 +1910,7 @@ TEST_F(QuicTransportTest, WriteOnlyFin) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   verifyCorrectness(conn, 0, stream, *buf, true);
@@ -1949,7 +1951,7 @@ TEST_F(QuicTransportTest, WriteImmediateAcks) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_TRUE(conn.outstandings.packets.empty());
@@ -2903,7 +2905,7 @@ TEST_F(QuicTransportTest, WriteAckNotSetLossAlarm) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, res.packetsWritten); // Write one packet out
@@ -2922,7 +2924,7 @@ TEST_F(QuicTransportTest, WriteWindowUpdate) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, res.packetsWritten); // Write one packet out
@@ -2958,7 +2960,7 @@ TEST_F(QuicTransportTest, WriteWindowUpdate) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, res.packetsWritten); // Write one packet out
@@ -3266,6 +3268,64 @@ TEST_F(QuicTransportTest, InvokeDeliveryCallbacksSingleByte) {
   Mock::VerifyAndClearExpectations(&unsentByteDeliveryCb);
 }
 
+TEST_F(QuicTransportTest, InvokeDeliveryCallbacksSingleByteWithDSR) {
+  // register all possible ways to get a DeliveryCb
+  //
+  // applications built atop QUIC may capture both first and last byte timings,
+  // which in this test are the same byte
+  StrictMock<MockDeliveryCallback> writeChainDeliveryCb;
+  StrictMock<MockDeliveryCallback> writeBufMetaDeliveryCb;
+  StrictMock<MockDeliveryCallback> firstByteDeliveryCb;
+  StrictMock<MockDeliveryCallback> lastByteDeliveryCb;
+  StrictMock<MockDeliveryCallback> unsentByteDeliveryCb;
+  auto stream = transport_->createBidirectionalStream().value();
+  auto dsrSender = std::make_unique<MockDSRPacketizationRequestSender>();
+  transport_->setDSRPacketizationRequestSender(stream, std::move(dsrSender));
+
+  auto buf = buildRandomInputData(1);
+  transport_->writeChain(
+      stream, buf->clone(), false /* eof */, &writeChainDeliveryCb);
+  transport_->writeBufMeta(
+      stream, BufferMeta(1), false, &writeBufMetaDeliveryCb);
+  transport_->registerDeliveryCallback(stream, 0, &firstByteDeliveryCb);
+  transport_->registerDeliveryCallback(stream, 1, &lastByteDeliveryCb);
+  transport_->registerDeliveryCallback(stream, 2, &unsentByteDeliveryCb);
+
+  // writeChain, first, last byte callbacks triggered after delivery
+  auto& conn = transport_->getConnectionState();
+  folly::SocketAddress addr;
+  conn.streamManager->addDeliverable(stream);
+  conn.lossState.srtt = 100us;
+  NetworkData networkData;
+  auto streamState = conn.streamManager->getStream(stream);
+  streamState->ackedIntervals.insert(0, 1);
+  EXPECT_CALL(writeChainDeliveryCb, onDeliveryAck(stream, 0, 100us)).Times(1);
+  EXPECT_CALL(writeBufMetaDeliveryCb, onDeliveryAck(stream, 1, 100us)).Times(1);
+  EXPECT_CALL(firstByteDeliveryCb, onDeliveryAck(stream, 0, 100us)).Times(1);
+  EXPECT_CALL(lastByteDeliveryCb, onDeliveryAck(stream, 1, 100us)).Times(1);
+  transport_->onNetworkData(addr, std::move(networkData));
+  Mock::VerifyAndClearExpectations(&writeChainDeliveryCb);
+  Mock::VerifyAndClearExpectations(&writeBufMetaDeliveryCb);
+  Mock::VerifyAndClearExpectations(&firstByteDeliveryCb);
+  Mock::VerifyAndClearExpectations(&lastByteDeliveryCb);
+
+  // try to set both offsets again
+  // callbacks should be triggered immediately
+  EXPECT_CALL(firstByteDeliveryCb, onDeliveryAck(stream, 0, _)).Times(1);
+  EXPECT_CALL(lastByteDeliveryCb, onDeliveryAck(stream, 1, _)).Times(1);
+  transport_->registerDeliveryCallback(stream, 0, &firstByteDeliveryCb);
+  transport_->registerDeliveryCallback(stream, 1, &lastByteDeliveryCb);
+  loopForWrites();
+  Mock::VerifyAndClearExpectations(&firstByteDeliveryCb);
+  Mock::VerifyAndClearExpectations(&lastByteDeliveryCb);
+
+  // unsentByteDeliveryCb::onByteEvent will never get called
+  // cancel gets called instead
+  EXPECT_CALL(unsentByteDeliveryCb, onCanceled(stream, 2)).Times(1);
+  transport_->close(folly::none);
+  Mock::VerifyAndClearExpectations(&unsentByteDeliveryCb);
+}
+
 TEST_F(QuicTransportTest, InvokeDeliveryCallbacksSingleByteWithFin) {
   // register all possible ways to get a DeliveryCb
   //
@@ -3381,6 +3441,91 @@ TEST_F(QuicTransportTest, InvokeTxCallbacksSingleByte) {
   // Even though we attempted to register the ByteEvent twice,  it resulted in
   // an error. So, onByteEventCanceled should be called only once.
   EXPECT_CALL(pastlastByteTxCb, onByteEventCanceled(getTxMatcher(stream, 1)))
+      .Times(1);
+  transport_->close(folly::none);
+  Mock::VerifyAndClearExpectations(&pastlastByteTxCb);
+}
+
+TEST_F(QuicTransportTest, InvokeTxCallbacksSingleByteDSR) {
+  StrictMock<MockByteEventCallback> firstByteTxCb;
+  StrictMock<MockByteEventCallback> dsrByteTxCb;
+  StrictMock<MockByteEventCallback> lastByteTxCb;
+  StrictMock<MockByteEventCallback> pastlastByteTxCb;
+  auto stream = transport_->createBidirectionalStream().value();
+  auto dsrSender = std::make_unique<MockDSRPacketizationRequestSender>();
+  transport_->setDSRPacketizationRequestSender(stream, std::move(dsrSender));
+
+  auto buf = buildRandomInputData(1);
+  transport_->writeChain(stream, buf->clone(), false /* eof */);
+  transport_->writeBufMeta(stream, BufferMeta(1), false);
+  EXPECT_CALL(firstByteTxCb, onByteEventRegistered(getTxMatcher(stream, 0)))
+      .Times(1);
+  EXPECT_CALL(dsrByteTxCb, onByteEventRegistered(getTxMatcher(stream, 1)))
+      .Times(1);
+  EXPECT_CALL(lastByteTxCb, onByteEventRegistered(getTxMatcher(stream, 1)))
+      .Times(1);
+  EXPECT_CALL(pastlastByteTxCb, onByteEventRegistered(getTxMatcher(stream, 2)))
+      .Times(1);
+  transport_->registerTxCallback(stream, 0, &firstByteTxCb);
+  transport_->registerTxCallback(stream, 1, &dsrByteTxCb);
+  transport_->registerTxCallback(stream, 1, &lastByteTxCb);
+  transport_->registerTxCallback(stream, 2, &pastlastByteTxCb);
+  Mock::VerifyAndClearExpectations(&firstByteTxCb);
+  Mock::VerifyAndClearExpectations(&dsrByteTxCb);
+  Mock::VerifyAndClearExpectations(&lastByteTxCb);
+  Mock::VerifyAndClearExpectations(&pastlastByteTxCb);
+
+  // first and last byte TX callbacks should be triggered immediately
+  EXPECT_CALL(firstByteTxCb, onByteEvent(getTxMatcher(stream, 0))).Times(1);
+  EXPECT_CALL(dsrByteTxCb, onByteEvent(getTxMatcher(stream, 1))).Times(1);
+  EXPECT_CALL(lastByteTxCb, onByteEvent(getTxMatcher(stream, 1))).Times(1);
+  transport_->getConnectionState().oneRttWriteCipher = test::createNoOpAead();
+  auto temp = test::createNoOpHeaderCipher();
+  temp->setDefaultKey();
+  transport_->getConnectionState().oneRttWriteHeaderCipher = std::move(temp);
+  CHECK(
+      transport_->getConnectionState().oneRttWriteCipher->getKey().has_value());
+  CHECK(transport_->getConnectionState().oneRttWriteHeaderCipher);
+  loopForWrites();
+  Mock::VerifyAndClearExpectations(&firstByteTxCb);
+  Mock::VerifyAndClearExpectations(&lastByteTxCb);
+  Mock::VerifyAndClearExpectations(&pastlastByteTxCb);
+
+  // try to set the first and last byte offsets again
+  // callbacks should be triggered immediately
+  EXPECT_CALL(firstByteTxCb, onByteEventRegistered(getTxMatcher(stream, 0)))
+      .Times(1);
+  EXPECT_CALL(dsrByteTxCb, onByteEventRegistered(getTxMatcher(stream, 1)))
+      .Times(1);
+  EXPECT_CALL(lastByteTxCb, onByteEventRegistered(getTxMatcher(stream, 1)))
+      .Times(1);
+  transport_->registerTxCallback(stream, 0, &firstByteTxCb);
+  transport_->registerTxCallback(stream, 1, &dsrByteTxCb);
+  transport_->registerTxCallback(stream, 1, &lastByteTxCb);
+  Mock::VerifyAndClearExpectations(&firstByteTxCb);
+  Mock::VerifyAndClearExpectations(&dsrByteTxCb);
+  Mock::VerifyAndClearExpectations(&lastByteTxCb);
+  EXPECT_CALL(firstByteTxCb, onByteEvent(getTxMatcher(stream, 0))).Times(1);
+  EXPECT_CALL(dsrByteTxCb, onByteEvent(getTxMatcher(stream, 1))).Times(1);
+  EXPECT_CALL(lastByteTxCb, onByteEvent(getTxMatcher(stream, 1))).Times(1);
+  loopForWrites(); // have to loop since processed async
+  Mock::VerifyAndClearExpectations(&firstByteTxCb);
+  Mock::VerifyAndClearExpectations(&dsrByteTxCb);
+  Mock::VerifyAndClearExpectations(&lastByteTxCb);
+
+  // Even if we register pastlastByte again, it shouldn't trigger
+  // onByteEventRegistered because this is a duplicate registration.
+  EXPECT_CALL(pastlastByteTxCb, onByteEventRegistered(getTxMatcher(stream, 2)))
+      .Times(0);
+  auto ret = transport_->registerTxCallback(stream, 2, &pastlastByteTxCb);
+  EXPECT_EQ(LocalErrorCode::INVALID_OPERATION, ret.error());
+  Mock::VerifyAndClearExpectations(&pastlastByteTxCb);
+
+  // pastlastByteTxCb::onByteEvent will never get called
+  // cancel gets called instead
+  // Even though we attempted to register the ByteEvent twice,  it resulted in
+  // an error. So, onByteEventCanceled should be called only once.
+  EXPECT_CALL(pastlastByteTxCb, onByteEventCanceled(getTxMatcher(stream, 2)))
       .Times(1);
   transport_->close(folly::none);
   Mock::VerifyAndClearExpectations(&pastlastByteTxCb);
@@ -4067,7 +4212,7 @@ TEST_F(QuicTransportTest, WriteStreamFromMiddleOfMap) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, conn.outstandings.packets.size());
@@ -4090,7 +4235,7 @@ TEST_F(QuicTransportTest, WriteStreamFromMiddleOfMap) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, conn.outstandings.packets.size());
@@ -4114,7 +4259,7 @@ TEST_F(QuicTransportTest, WriteStreamFromMiddleOfMap) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_EQ(1, conn.outstandings.packets.size());
@@ -4142,7 +4287,7 @@ TEST_F(QuicTransportTest, NoStream) {
       *conn.clientConnectionId,
       *conn.serverConnectionId,
       *aead_,
-      *headerCipher_,
+      *conn.oneRttWriteHeaderCipher,
       transport_->getVersion(),
       conn.transportSettings.writeConnectionDataPacketsLimit);
   EXPECT_TRUE(conn.outstandings.packets.empty());
@@ -4593,8 +4738,11 @@ TEST_F(QuicTransportTest, ResetDSRStream) {
   transport_->setDSRPacketizationRequestSender(streamId, std::move(dsrSender));
   EXPECT_TRUE(
       transport_->writeChain(streamId, std::move(buf), false).hasValue());
+  ASSERT_NE(conn.streamManager->getStream(streamId), nullptr);
   EXPECT_TRUE(transport_->writeBufMeta(streamId, meta, false).hasValue());
   loopForWrites();
+  auto stream = conn.streamManager->getStream(streamId);
+  ASSERT_NE(stream, nullptr);
   conn.streamManager->getStream(streamId)->writeBufMeta.split(
       conn.udpSendPacketLen - 200);
 
@@ -4647,6 +4795,183 @@ TEST_F(QuicTransportTest, SetMaxPacingRateWithAndWithoutPacing) {
   transport_->setTransportSettings(settings);
   auto res2 = transport_->setMaxPacingRate(125000);
   EXPECT_FALSE(res2.hasError());
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableInvalidStream) {
+  // Stream ID is for a peer-initiated bidirectional stream that doesn't exist
+  StreamId id = 0b100;
+  auto maxWritable = transport_->getMaxWritableOnStream(id);
+  // max writable on non-existent stream returns an error
+  EXPECT_TRUE(maxWritable.hasError());
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableOnIncomingUnidirectionalStream) {
+  auto& conn = transport_->getConnectionState();
+  // Stream ID is for a peer-initiated unidirectional stream
+  StreamId id = 0b110;
+  conn.streamManager->getStream(id);
+  auto maxWritable = transport_->getMaxWritableOnStream(id);
+  // max writable on receive only stream returns an error
+  EXPECT_TRUE(maxWritable.hasError());
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableStreamFlowControlLimited) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream ID is for a peer-initiated bidirectional stream
+  StreamId id = 0b100;
+  auto stream = conn.streamManager->getStream(id);
+
+  // set stream fcw < both conn fc and total buffer space available, such that
+  // we're limited by stream fcw
+  stream->flowControlState.peerAdvertisedMaxOffset = 1500;
+  conn.flowControlState.peerAdvertisedMaxOffset = 2000;
+  transportSettings.totalBufferSpaceAvailable = 2000;
+  transport_->setTransportSettings(transportSettings);
+
+  auto maxWritable = transport_->getMaxWritableOnStream(id);
+  EXPECT_FALSE(maxWritable.hasError());
+  EXPECT_EQ(*maxWritable, stream->flowControlState.peerAdvertisedMaxOffset);
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableConnFlowControlLimited) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream ID is for a peer-initiated bidirectional stream
+  StreamId id = 0b100;
+  auto stream = conn.streamManager->getStream(id);
+
+  // set conn fcw < both stream fcw and buffer space, such that we're conn fcw
+  // limited
+  conn.flowControlState.peerAdvertisedMaxOffset = 1500;
+  transportSettings.totalBufferSpaceAvailable = 2000;
+  transport_->setTransportSettings(transportSettings);
+  stream->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  auto maxWritable = transport_->getMaxWritableOnStream(id);
+  EXPECT_FALSE(maxWritable.hasError());
+  EXPECT_EQ(*maxWritable, conn.flowControlState.peerAdvertisedMaxOffset);
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableBufferSpaceLimited) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream ID is for a peer-initiated bidirectional stream
+  StreamId id = 0b100;
+  auto stream = conn.streamManager->getStream(id);
+
+  // set total buffer space available < stream and conn fcw, such that
+  // we're limited by buffer space
+  transportSettings.totalBufferSpaceAvailable = 1500;
+  transport_->setTransportSettings(transportSettings);
+  stream->flowControlState.peerAdvertisedMaxOffset = 2000;
+  conn.flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  auto maxWritable = transport_->getMaxWritableOnStream(id);
+  EXPECT_FALSE(maxWritable.hasError());
+  EXPECT_EQ(*maxWritable, transportSettings.totalBufferSpaceAvailable);
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableStreamFlowControlLimitedTwoStreams) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream IDs are for a peer-initiated bidirectional stream
+  StreamId id1 = 0b100;
+  StreamId id2 = 0b1100;
+
+  // let's assume we have 1k bytes left in each window
+  auto stream1 = conn.streamManager->getStream(id1);
+  stream1->currentWriteOffset = 1000;
+  stream1->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  auto stream2 = conn.streamManager->getStream(id2);
+  stream2->currentWriteOffset = 1000;
+  stream2->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  // set sum of write offset accordingly
+  conn.flowControlState.sumCurWriteOffset = 2000;
+
+  // set stream fcw < both conn fcw and total buffer space available, such that
+  // we're limited by stream fcw
+  conn.flowControlState.peerAdvertisedMaxOffset = 4000;
+  transportSettings.totalBufferSpaceAvailable = 2000;
+  transport_->setTransportSettings(transportSettings);
+
+  auto maxWritable1 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable1.hasError());
+  EXPECT_EQ(*maxWritable1, 1000);
+
+  auto maxWritable2 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable2.hasError());
+  EXPECT_EQ(*maxWritable2, 1000);
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableConnFlowControlLimitedTwoStreams) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream IDs are for a peer-initiated bidirectional stream
+  StreamId id1 = 0b100;
+  StreamId id2 = 0b1100;
+
+  // let's assume we have 1k bytes left in each window
+  auto stream1 = conn.streamManager->getStream(id1);
+  stream1->currentWriteOffset = 1000;
+  stream1->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  auto stream2 = conn.streamManager->getStream(id2);
+  stream2->currentWriteOffset = 1000;
+  stream2->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  // set sum of write offset accordingly
+  conn.flowControlState.sumCurWriteOffset = 2000;
+
+  // set conn fcw < both stream fcw and total buffer space available, such that
+  // we're limited by conn fcw
+  conn.flowControlState.peerAdvertisedMaxOffset = 2500;
+  transportSettings.totalBufferSpaceAvailable = 800;
+  transport_->setTransportSettings(transportSettings);
+
+  auto maxWritable1 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable1.hasError());
+  EXPECT_EQ(*maxWritable1, 500);
+
+  auto maxWritable2 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable2.hasError());
+  EXPECT_EQ(*maxWritable2, 500);
+}
+
+TEST_F(QuicTransportTest, GetMaxWritableBufferSpaceLimitedTwoStreams) {
+  auto& conn = transport_->getConnectionState();
+  auto transportSettings = transport_->getTransportSettings();
+  // Stream IDs are for a peer-initiated bidirectional stream
+  StreamId id1 = 0b100;
+  StreamId id2 = 0b1100;
+
+  // let's assume we have 1k bytes left in each window
+  auto stream1 = conn.streamManager->getStream(id1);
+  stream1->currentWriteOffset = 1000;
+  stream1->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  auto stream2 = conn.streamManager->getStream(id2);
+  stream2->currentWriteOffset = 1000;
+  stream2->flowControlState.peerAdvertisedMaxOffset = 2000;
+
+  // set sum of write offset accordingly
+  conn.flowControlState.sumCurWriteOffset = 2000;
+
+  // set total buffer space available < stream and conn fcw, such that we're
+  // limited by buffer space
+  transportSettings.totalBufferSpaceAvailable = 500;
+  transport_->setTransportSettings(transportSettings);
+  conn.flowControlState.peerAdvertisedMaxOffset = 3000;
+
+  auto maxWritable1 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable1.hasError());
+  EXPECT_EQ(*maxWritable1, transportSettings.totalBufferSpaceAvailable);
+
+  auto maxWritable2 = transport_->getMaxWritableOnStream(id1);
+  EXPECT_FALSE(maxWritable2.hasError());
+  EXPECT_EQ(*maxWritable2, transportSettings.totalBufferSpaceAvailable);
 }
 
 } // namespace test
